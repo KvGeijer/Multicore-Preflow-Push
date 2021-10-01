@@ -8,7 +8,7 @@
 #include <stdatomic.h>
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
-#define PRINT		1	/* enable/disable prints. */
+#define PRINT		0	/* enable/disable prints. */
 #define NUM_THREADS 5
 #define LOCAL_QUEUE 2
 
@@ -569,8 +569,7 @@ static node_t* leave_global_excess(graph_t* g, thread_t* attr)
 			pr("@%d: returning NULL, waiting = %d\n", attr->thread_id, g->excess.waiting);
 			return NULL;
 		}
-
-		if (g->excess.waiting < NUM_THREADS)
+		else if (g->excess.waiting < NUM_THREADS)
 		{
 			// normal case
 			// TODO: Try busy wait
@@ -637,6 +636,7 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		// Must be the sink!
 		pr("@%d: Sink completely filled\n", attr->thread_id);
 		assert(v == g->t);
+		pthread_cond_broadcast(&g->excess.cond);
 		clear_flags(g->threads);	//TODO: More?
 	}
 }
