@@ -9,7 +9,7 @@
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
 #define PRINT		0	/* enable/disable prints. */
-#define NUM_THREADS 5
+#define NUM_THREADS 20
 #define LOCAL_QUEUE 2
 
 #define FORSETE		0
@@ -31,9 +31,9 @@
 #if PRINT
 pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#define pr(...)		do {	pthread_mutex_lock(&print_lock);		\
+#define pr(...)		do {	/*pthread_mutex_lock(&print_lock); */		\
 							printf(__VA_ARGS__);		\
-							pthread_mutex_unlock(&print_lock);	\
+							/*pthread_mutex_unlock(&print_lock);*/	\
 					} while (0)
 #else
 #define pr(...)
@@ -636,8 +636,8 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		// Must be the sink!
 		pr("@%d: Sink completely filled\n", attr->thread_id);
 		assert(v == g->t);
-		pthread_cond_broadcast(&g->excess.cond);
 		clear_flags(g->threads);	//TODO: More?
+		pthread_cond_broadcast(&g->excess.cond);
 	}
 }
 
