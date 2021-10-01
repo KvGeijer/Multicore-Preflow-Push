@@ -8,16 +8,14 @@
 #include <stdatomic.h>
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
-#define PRINT		0	/* enable/disable prints. */
-#define NUM_THREADS 20
+#define PRINT		1	/* enable/disable prints. */
+#define NUM_THREADS 5
 #define LOCAL_QUEUE 2
 
+#define FORSETE		0
+//#define NDEBUG
+
 #include <assert.h>
-
-#define FORSETE		1
-#define NDEBUG
-
-
 
 #if COLLECT_STATS
 #define count_stat(x) 	(x += 1);
@@ -79,9 +77,10 @@ struct stats_t {
 };
 
 struct thread_t {
-	int thread_id;
+	short thread_id;
+	short nbr_nodes;
 	node_t* next;	/* Private work queue */
-	int nbr_nodes;
+	atomic_flag cont;
 
 #if COLLECT_STATS
 	stats_t stats;
@@ -90,7 +89,8 @@ struct thread_t {
 
 struct init_info_t {
 	graph_t* g;
-	int thread_id; 
+	pthread_barrier_t* init_barrier;
+	short thread_id; 
 };
 
 struct list_t {
@@ -99,7 +99,7 @@ struct list_t {
 };
 
 struct locked_node_list_t {
-	int waiting;
+	short waiting;
 	int size;
 	node_t* u;
 	pthread_mutex_t mutex;
@@ -128,7 +128,10 @@ struct graph_t {
 	edge_t*		e;	/* array of m edges.		*/
 	node_t*		s;	/* source.			*/
 	node_t*		t;	/* sink.			*/
+
+	// TODO: Move the excess list and threads somewhere else?
 	locked_node_list_t excess;	/* nodes with e > 0 except s,t.	*/
+	thread_t** threads;
 };
 
 typedef struct static_graph_t static_graph_t;
@@ -138,6 +141,7 @@ struct static_graph_t {
 	node_t* v;
 	edge_t* e;
 	list_t* links;
+	thread_t** threads;
 };
 
 static char* progname;
@@ -219,8 +223,6 @@ static void* xmalloc(size_t s)
 static void* xcalloc(size_t n, size_t s)
 {
 	void*		p;
-
-	assert(0);
 
 	p = xmalloc(n * s);
 
@@ -334,8 +336,11 @@ static void init_static_parts(graph_t* g, static_graph_t* stat_g)
 	stat_g->e = xcalloc(g->m, sizeof(edge_t));
 	stat_g->links = xcalloc(g->m * 2, sizeof(list_t));
 
+	stat_g->threads = xcalloc(NUM_THREADS, sizeof(thread_t*));
+
 	g->v = stat_g->v;
 	g->e = stat_g->e;
+	g->threads = stat_g->threads;
 
 	for (i = 0; i < g->n; i++) {
 		pthread_mutex_init(&g->v[i].mutex, NULL);
@@ -347,6 +352,9 @@ static void update_static_parts(graph_t* g, static_graph_t* stat_g)
 {
 	int i;
 	int j;
+
+	// Pointer to array of pointers to the thread_t structs.
+	g->threads = stat_g->threads;
 
 	// Nodes
 	if (g->n > stat_g->n){
@@ -442,6 +450,18 @@ static void init_graph(graph_t* g, int n, int m, int s, int t, xedge_t* e)
 
 }
 
+static void clear_flags(thread_t** threads)
+{
+	int i;
+	pr("CLEARING FLAGS\n");
+
+	for (i = 0; i < NUM_THREADS; i += 1)
+	{
+		// TODO: Can this be relaxed?
+		atomic_flag_clear_explicit(&threads[i]->cont, memory_order_seq_cst);
+	}
+}
+
 static void enter_private_excess(node_t* v, thread_t* attr)
 {
 	/* Enter the node v into the private work queue.
@@ -494,16 +514,16 @@ static void enter_excess(graph_t* g, node_t* v, thread_t* attr)
 	// TODO: Good way to decide which queue to add to. 
 	if (attr->nbr_nodes < LOCAL_QUEUE)
 	{
-		pr("@%d: entering private excess, nbr private = %d, nbr global? = %d\n", 
-			attr->thread_id, attr->nbr_nodes, g->excess.size);
+		pr("@%d: entering private excess, node = %d, nbr private = %d\n", 
+			attr->thread_id, id(g, v), attr->nbr_nodes);
 
 		enter_private_excess(v, attr);
 	}
 	else 
 	{
 		
-		pr("@%d: entering global excess, nbr private = %d, nbr global = %d\n", 
-			attr->thread_id, attr->nbr_nodes, g->excess.size);
+		pr("@%d: entering global excess, node = %d, nbr private = %d\n", 
+			attr->thread_id, id(g, v), attr->nbr_nodes);
 
 		enter_global_excess(g, v);
 	}
@@ -518,6 +538,7 @@ static node_t* leave_private_excess(thread_t* attr)
 	attr->next = u->next;
 	attr->nbr_nodes -= 1;
 
+	assert(u != NULL);
 	return u;
 }
 
@@ -532,36 +553,37 @@ static node_t* leave_global_excess(graph_t* g, thread_t* attr)
 
 	pthread_mutex_lock(&g->excess.mutex);
 
-	// ERROR: Reading g->t->e is not thread safe... Maybe replace with an atomic flag?
-	while (g->excess.u == NULL && g->t->e < 0)
+	// ERROR: Reading g->t->e is not thread safe... Use the atomic flag!
+	while (g->excess.u == NULL)
 	{
-
-		// TODO: prettify!
 		g->excess.waiting += 1;
-		assert(g->excess.waiting <= NUM_THREADS);
-		pr("@%d: waiting, waiting = %d\n", attr->thread_id, g->excess.waiting);
+
+		if (g->excess.waiting == NUM_THREADS || 
+			!atomic_flag_test_and_set_explicit(&attr->cont, memory_order_relaxed)) 
+		{
+			// TODO: recycle threads.
+			pthread_mutex_unlock(&g->excess.mutex);
+			pthread_cond_signal(&g->excess.cond);
+			print_stats(attr);
+
+			pr("@%d: returning NULL, waiting = %d\n", attr->thread_id, g->excess.waiting);
+			return NULL;
+		}
 
 		if (g->excess.waiting < NUM_THREADS)
 		{
 			// normal case
 			// TODO: Try busy wait
+			assert(g->excess.waiting <= NUM_THREADS);
+			pr("@%d: waiting, waiting = %d\n", attr->thread_id, g->excess.waiting);
+
 			pthread_cond_wait(&g->excess.cond, &g->excess.mutex);
 			g->excess.waiting -= 1;
 		}
-		else if (g->excess.waiting == NUM_THREADS || g->t->e == 0) 
-		{	
-			break;
-		}
-		
 	}
+
+	// TODO: additional check here for flag? Feels a bit much
 	
-	if (g->excess.u == NULL || g->t->e == 0) {	// TODO: ugly
-		// TODO: recycle threads. Maybe return null instead?
-		pthread_mutex_unlock(&g->excess.mutex);
-		pthread_cond_signal(&g->excess.cond);
-		print_stats(attr);
-		pthread_exit(NULL);
-	}
 
 	v = g->excess.u;
 
@@ -610,6 +632,12 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		 */
 
 		enter_excess(g, v, attr);
+	} 
+	else if (v->e == 0) {
+		// Must be the sink!
+		pr("@%d: Sink completely filled\n", attr->thread_id);
+		assert(v == g->t);
+		clear_flags(g->threads);	//TODO: More?
 	}
 }
 
@@ -641,6 +669,9 @@ static void source_pushes(graph_t* g, thread_t* attr)
 	edge_t* e;
 	int n;
 
+	count_stat(attr->stats.nodes_processed);
+	attr->nbr_nodes += NUM_THREADS*3;		// TODO: Ugly
+
 	pr("@%d: Starting source pushes\n", attr->thread_id);
 
 	s = g->s;
@@ -668,6 +699,8 @@ static void source_pushes(graph_t* g, thread_t* attr)
 
 	pthread_mutex_unlock(&s->mutex);
 
+	attr->nbr_nodes -= NUM_THREADS*3;
+
 }
 
 
@@ -676,12 +709,16 @@ static int xpreflow(graph_t* g)
 	init_info_t init_infos[NUM_THREADS];
 	pthread_t pthreads[NUM_THREADS];
 
-	int i; 
+	int i;
 	int f;
+
+	pthread_barrier_t init_barrier;
+	pthread_barrier_init(&init_barrier, NULL, NUM_THREADS);
 
 	for (i = 0; i < NUM_THREADS; i++) {
 		init_infos[i].g = g;
 		init_infos[i].thread_id = i;
+		init_infos[i].init_barrier = &init_barrier;
 		pthread_create(&pthreads[i], NULL, &run, &init_infos[i]);
 	}
 
@@ -796,19 +833,23 @@ static void process_node(node_t* u, graph_t* g, thread_t* attr)
 static node_t* leave_excess(graph_t* g, thread_t* attr)
 {
 	// TODO: change from stack?
-
 	node_t* u;
-	if (attr->next == NULL) 
+
+	if (!atomic_flag_test_and_set_explicit(&attr->cont, memory_order_relaxed))
+	{
+		return NULL;
+	}
+	else if (attr->next == NULL) 
 	{
 		u = leave_global_excess(g, attr);
 
-		pr("@%d: getting local node: %d\n", attr->thread_id, id(g, u));
+		pr("@%d: getting global node: %d\n", attr->thread_id, id(g, u));
 	}
 	else 
 	{
 		u = leave_private_excess(attr);
 
-		pr("@%d: getting global node: %d\n", attr->thread_id, id(g, u));
+		pr("@%d: getting private node: %d\n", attr->thread_id, id(g, u));
 	}
 
 	return u;
@@ -822,9 +863,10 @@ static void* run(void* arg)
 	node_t* u;
 	graph_t* g = init->g;
 	
-	thread_t attr = {		.thread_id = init->thread_id, 
+	thread_t attr = {		.thread_id = init->thread_id, 	//TODO: Remove from struct
 							.next = NULL, 
 							.nbr_nodes = 0,
+							.cont = 1,			//ERROR: Does this work?
 #if COLLECT_STATS
 							.stats = {0},
 #endif
@@ -832,20 +874,31 @@ static void* run(void* arg)
 
 	pr("@%d: starting run\n", attr.thread_id);
 
-	if (attr.thread_id == 0) {
-		count_stat(attr.stats.nodes_processed);
-		attr.nbr_nodes += NUM_THREADS*3;		// TODO: Ugly
-		source_pushes(g, &attr);
-		attr.nbr_nodes -= NUM_THREADS*3;
-	}
+	// TODO: Should we just have pointers to the flags?
+	g->threads[attr.thread_id] = &attr;
 
-	while(1)
-	{
-		u = leave_excess(g, &attr);
-		pr("@%d: selected u = %d with h = %d and e = %d\n", attr.thread_id, id(g, u), u->h, u->e);
+	// Make sure everything is initialized properly before starting the algorithm
+	pthread_barrier_wait(init->init_barrier);
 
-		process_node(u, g, &attr);
-		count_stat(attr.stats.nodes_processed);
+	while(1){
+
+		pr("@%d: Starting a new graph\n", attr.thread_id);
+
+		if (attr.thread_id == 0) {
+			source_pushes(g, &attr);
+		}
+
+		while((u = leave_excess(g, &attr)) != NULL)
+		{
+			pr("@%d: selected u = %d with h = %d and e = %d\n", attr.thread_id, id(g, u), u->h, u->e);
+
+			process_node(u, g, &attr);
+			count_stat(attr.stats.nodes_processed);
+		}
+
+		pr("@%d: Finished a graph\n", attr.thread_id);
+		pthread_exit(0);	// TODO: Make threads have static lifetime
+
 	}
 
 	return NULL;
