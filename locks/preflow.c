@@ -12,7 +12,7 @@
 #define NUM_THREADS 20
 #define LOCAL_QUEUE 2
 
-#define FORSETE		0
+#define FORSETE		1
 #define NDEBUG
 
 #include <assert.h>
@@ -700,7 +700,10 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		pr("@%d: Sink completely filled\n", thread->thread_id);
 		assert(v == g->t);
 		clear_flags(thread->threads);	//TODO: More?
+
+		pthread_mutex_lock(&g->excess.mutex);
 		pthread_cond_broadcast(&g->excess.cond);	// ERROR: probably not really thread safe
+		pthread_mutex_unlock(&g->excess.mutex);
 	}
 }
 
