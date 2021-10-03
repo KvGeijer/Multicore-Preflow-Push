@@ -912,7 +912,7 @@ static node_t* leave_excess(graph_t* g, thread_t* thread)
 
 static void init_thread(thread_t* thread, init_info_t* init, pthread_barrier_t* barrier)
 {
-	*thread = 		(thread_t){	.thread_id = init->thread_id, 	//TODO: Remove from struct?
+	*thread = (thread_t){	.thread_id = init->thread_id, 	//TODO: Remove from struct?
 						.next = NULL, 
 						.nbr_nodes = 0,
 						.g = NULL,
@@ -943,12 +943,12 @@ static void* run(void* arg)
 
 	barrier = init->barrier;
 	init_thread(&thread, init, barrier);
-	g = thread.g;	// TODO: Just use ref in thread?
 
 	while(1){
 
 		// Synchronize the threads at the start and end of each graph!
 		pthread_barrier_wait(barrier);
+		g = thread.g;	// TODO: Just use reference in thread?
 
 		pr("@%d: Starting a new graph with n = %d, m = %d\n", thread.thread_id, g->n, g->m);
 
