@@ -701,9 +701,7 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		assert(v == g->t);
 		clear_flags(thread->threads);	//TODO: More?
 
-		pthread_mutex_lock(&g->excess.mutex);
-		pthread_cond_broadcast(&g->excess.cond);	// ERROR: probably not really thread safe
-		pthread_mutex_unlock(&g->excess.mutex);
+		pthread_cond_broadcast(&g->excess.cond);	// ERROR: maybe wonky
 	}
 }
 
@@ -934,6 +932,12 @@ static void init_thread(thread_t* thread, init_info_t* init, pthread_barrier_t* 
 	pr("@%d: starting run\n", thread->thread_id);
 }
 
+static void reset_thread(thread_t* thread)
+{
+	thread->nbr_nodes = 0;
+	thread->next = NULL;
+}
+
 static void* run(void* arg)
 {
 	/* Run method for the threads */
@@ -970,6 +974,7 @@ static void* run(void* arg)
 		pr("@%d: Finished a graph\n", thread.thread_id);
 		print_stats(&thread);
 		pthread_barrier_wait(barrier);
+		reset_thread(&thread);
 
 	}
 
