@@ -858,6 +858,10 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 
 	pthread_mutex_lock(&u->mutex);
 
+	if (atomic_load_explicit(&u->h, memory_order_relaxed)) {
+		relabel(g, u, thread);
+	}
+
 	while (u->e > 0) {
 
 		p = u->edge;
