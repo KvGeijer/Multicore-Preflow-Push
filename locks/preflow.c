@@ -12,6 +12,13 @@
 #define NUM_THREADS 20
 #define LOCAL_QUEUE 2
 
+/************** MEMORY CONSTANTS **************/
+
+#define MEMORY_UPDATE		2
+#define STARTING_ADJ		1500	// TODO
+
+/**********************************************/
+
 #define FORSETE		1
 #define NDEBUG
 
@@ -42,26 +49,16 @@ pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
 #define MIN(a,b)	(((a)<=(b))?(a):(b))
 
 
-/* introduce names for some structs. a struct is like a class, except
- * it cannot be extended and has no member methods, and everything is
- * public.
- *
- * using typedef like this means we can avoid writing 'struct' in 
- * every declaration. no new type is introduded and only a shorter name.
- *
- */
-
 typedef struct graph_t	graph_t;
 typedef struct node_t	node_t;
 typedef struct edge_t	edge_t;
-typedef struct list_t	list_t;
+typedef struct adj_t 	adj_t;
 typedef struct locked_node_list_t	locked_node_list_t;
 typedef struct thread_t thread_t;
 typedef struct init_info_t init_info_t;
 typedef struct stats_t stats_t;
 typedef struct static_graph_t static_graph_t;
 
-// TODO: toggle for this?
 typedef struct xedge_t	xedge_t;
 struct xedge_t {
 	int32_t		u;	/* one of the two nodes.	*/
@@ -98,11 +95,6 @@ struct init_info_t {
 	short thread_id; 
 };
 
-struct list_t {
-	edge_t*		edge;
-	list_t*		next;
-};
-
 struct locked_node_list_t {
 	short waiting;
 	int size;
@@ -114,16 +106,22 @@ struct locked_node_list_t {
 struct node_t {
 	atomic_int	h;	/* height.			*/
 	int		e;	/* excess flow.			*/
-	list_t*		edge;	/* adjacency list.		*/
+	int 	nbr_edge;	/* The number of edges for the node */
+	adj_t*		adj;	/* adjacency list.		*/
 	node_t*		next;	/* with excess preflow.		*/
 	pthread_mutex_t mutex; 	/* processing lock */
 };
 
-struct edge_t {
-	node_t*		u;	/* one of the two nodes.	*/
-	node_t*		v;	/* the other. 			*/
+struct edge_t {	// TODO: Reuse xedge_t?!
 	int		f;	/* flow > 0 if from u to v.	*/
 	int		c;	/* capacity.			*/
+};
+
+
+struct adj_t {
+	int v;		/* The index of the other node */ 
+	int index;	/* The index of the edge in the larger edge array */ 
+	short dir;	/* Forward or backward edge in relation to the node */
 };
 
 struct graph_t {
@@ -134,7 +132,6 @@ struct graph_t {
 	node_t*		s;	/* source.			*/
 	node_t*		t;	/* sink.			*/
 
-	// TODO: Move the excess list and threads somewhere else?
 	locked_node_list_t excess;	/* nodes with e > 0 except s,t.	*/
 };
 
@@ -142,9 +139,9 @@ struct static_graph_t {
 	int n;
 	int m;
 
+	int* alloced_adj;
 	node_t* v;
 	edge_t* e;
-	list_t* links;
 
 	thread_t** threads;	// TODO: Test changing to an array of pointers
 	pthread_barrier_t barrier;
@@ -170,7 +167,7 @@ static int id(graph_t* g, node_t* v)
 
 // function definitions
 static void* run(void* arg);
-static void try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread);
+static void try_push(node_t* u, node_t* v, edge_t* e, short dir, graph_t* g, thread_t* thread);
 static void destroy_graph(graph_t* g);
 
 void error(const char* fmt, ...)
@@ -248,40 +245,8 @@ static void print_stats(thread_t* thread)
 #endif
 }
 
-static void add_edge(node_t* u, edge_t* e, list_t* p)
-{
-
-	/* allocate memory for a list link and put it first
-	 * in the adjacency list of u.
-	 *
-	 */
-
-	assert(u->edge != p);
-	p->edge = e;
-	p->next = u->edge;
-	u->edge = p;
-}
-
-static void connect(node_t* u, node_t* v, int c, edge_t* e, list_t* link1, list_t* link2)
-{
-	/* connect two nodes by putting a shared (same object)
-	 * in their adjacency lists.
-	 *
-	 */
-
-	e->u = u;
-	e->v = v;
-	e->c = c;
-
-	add_edge(u, e, link1);
-	add_edge(v, e, link2);
-}
-
 static void init_lockedList(locked_node_list_t* list)
 {
-
-	//TODO: Assign statically?
-
 	pthread_mutex_init(&list->mutex, NULL);
 	pthread_cond_init(&list->cond, NULL);
 
@@ -290,41 +255,69 @@ static void init_lockedList(locked_node_list_t* list)
 	list->waiting = 0;
 }
 
-static void init_edges_forsete(graph_t* g, xedge_t* e, static_graph_t* stat_g)
+static inline void connect(node_t* u, int vi, int ei, int* static_cap, short forward)
+{
+	/* connect an edge with a node by initializing the adj object.
+	 */
+
+	adj_t* adj;
+
+	if (u->nbr_edge >= *static_cap) {
+		*static_cap *= MEMORY_UPDATE;
+		u->adj = realloc(u->adj, *static_cap);
+	}
+
+	adj = &u->adj[u->nbr_edge];
+	adj->v = vi;
+	adj->index = ei;
+	adj->dir = forward;
+
+	u->nbr_edge += 1;
+}
+
+static void init_edges_forsete(graph_t* g, xedge_t* e, int* static_caps)
 {
 	node_t *u;
 	node_t *v;
-	int a;
-	int b;
+	int ui;
+	int vi;
 	int c;
 	int i;
 
 	for (i = 0; i < g->m; i += 1) {
-		a = e[i].u;
-		b = e[i].v;
+		ui = e[i].u;
+		vi = e[i].v;
 		c = e[i].c;
-		u = &g->v[a];
-		v = &g->v[b];
-		connect(u, v, c, g->e+i, stat_g->links+(i*2), stat_g->links+(i*2) + 1);
+		u = &g->v[ui];
+		v = &g->v[vi];
+
+		connect(u, vi, i, static_caps + ui, 1);
+		connect(v, ui, i, static_caps + vi, 0);
+		pr("Connecting u: %d == %d and v: %d == %d\n", ui, id(g, u), vi, id(g, v));
+		g->e[i].c = c;
 	}
 }
 
-static void init_edges_normal(graph_t* g, static_graph_t* stat_g)
+static void init_edges_normal(graph_t* g, int* static_caps)
 {
 	node_t *u;
 	node_t *v;
-	int a;
-	int b;
+	int ui;
+	int vi;
 	int c;
 	int i;
 
 	for (i = 0; i < g->m; i += 1) {
-		a = next_int();
-		b = next_int();
+		ui = next_int();
+		vi = next_int();
 		c = next_int();
-		u = &g->v[a];
-		v = &g->v[b];
-		connect(u, v, c, g->e+i, stat_g->links+(i*2), stat_g->links+(i*2) + 1);
+		u = &g->v[ui];
+		v = &g->v[vi];
+
+		connect(u, vi, i, static_caps + ui, 1);
+		connect(v, ui, i, static_caps + vi, 0);
+		pr("Connecting u: %d == %d and v: %d == %d\n", ui, id(g, u), vi, id(g, v));
+		g->e[i].c = c;
 	}
 
 	fclose(stdin);
@@ -360,13 +353,14 @@ static void init_threads(thread_t** threads, pthread_barrier_t* barrier)
 	
 	pr("MAIN: Waiting from thread links\n");
 	pthread_barrier_wait(barrier);
-	pr("MAIN: thread_t thread_index at index 1: %d\n", threads[1]->thread_id);
 
 }
 
 static void init_static_graph(static_graph_t* stat_g, int n, int m)
 {
 	int i;
+	int edges_per_node;
+	int adj_per_node;
 
 	// TODO: allocate more memory than immediately needed
 	stat_g->n = n;
@@ -374,16 +368,20 @@ static void init_static_graph(static_graph_t* stat_g, int n, int m)
 
 	stat_g->v = xcalloc(n, sizeof(node_t));
 	stat_g->e = xcalloc(m, sizeof(edge_t));
-	stat_g->links = xcalloc(m * 2, sizeof(list_t));
+
+	stat_g->alloced_adj = xmalloc(m * sizeof(edge_t));
+
+	for (i = 0; i < n; i += 1) {
+		
+		stat_g->v[i].adj = xcalloc(STARTING_ADJ, sizeof(adj_t*));	
+		stat_g->alloced_adj[i] = STARTING_ADJ;
+		pthread_mutex_init(&stat_g->v[i].mutex, NULL);
+	}
 
 	stat_g->threads = xcalloc(NUM_THREADS, sizeof(thread_t*));
 	pthread_barrier_init(&stat_g->barrier, NULL, NUM_THREADS + 1);
 
 	init_threads(stat_g->threads, &stat_g->barrier);
-
-	for (i = 0; i < n; i++) {
-		pthread_mutex_init(&stat_g->v[i].mutex, NULL);
-	}
 
 }
 
@@ -397,7 +395,10 @@ static void update_static_graph(static_graph_t* stat_g, int n, int m)
 		stat_g->v = realloc(stat_g->v, n * sizeof(node_t));
 
 		for (i = stat_g->n; i < n; i++) {
+			stat_g->v[i].adj = xcalloc(STARTING_ADJ, sizeof(adj_t*));	
+			stat_g->alloced_adj[i] = STARTING_ADJ;
 			pthread_mutex_init(&stat_g->v[i].mutex, NULL);
+
 		}
 
 		stat_g->n = n;
@@ -407,7 +408,6 @@ static void update_static_graph(static_graph_t* stat_g, int n, int m)
 	// Edges
 	if (m > stat_g->m){
 		stat_g->e = realloc(stat_g->e, m * sizeof(edge_t));
-		stat_g->links = realloc(stat_g->links, m * 2 * sizeof(edge_t));
 
 		stat_g->m = m;
 	}
@@ -424,10 +424,10 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 		g->v[i].e = 0;
 		atomic_store_explicit(&g->v[i].h, 0, memory_order_relaxed);
 		g->v[i].next = NULL;
-		g->v[i].edge = NULL;
+		g->v[i].nbr_edge = 0;
 	}
 	g->v[0].e = 0;
-	g->v[0].edge = NULL;	// TODO: Where is s.h updated?
+	g->v[0].nbr_edge = 0;
 
 
 	g->e = stat_g->e;
@@ -438,20 +438,20 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 
 	g->s = &g->v[s];
 	g->t = &g->v[t];
-	atomic_store_explicit(&g->s->h, g->n, memory_order_release);
+	atomic_store_explicit(&g->s->h, g->n, memory_order_relaxed);
 
 }
 
 static void adjust_sink_height(graph_t* g)
 {
-	list_t* p;
+	adj_t* adj;
 	int max_cap;
+	int i;
 
+	adj = g->t->adj;
 	max_cap = 0;
-	p = g->t->edge;
-	while (p != NULL) {
-		max_cap += p->edge->c;
-		p = p->next;
+	for (i = 0; i < g->t->nbr_edge; i+= 1) {
+		max_cap += g->e[adj[i].index].c;
 	}
 
 	g->t->e = -max_cap;
@@ -466,7 +466,6 @@ static void prepare_threads(graph_t* g, thread_t** threads)
 	for (int i = 0; i < NUM_THREADS; i += 1){
 		thread = threads[i];
 		thread->g = g;
-		pr("prepping: %d, %d = %d = %d\n", i, g->n, threads[i]->g->n, thread->g->n);
 		// ERROR: Do we need more here? Is the flag already set?
 	}
 }
@@ -503,9 +502,9 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 	init_lockedList(&g->excess);
 
 #if (FORSETE)
-	init_edges_forsete(g, e, stat_g);
+	init_edges_forsete(g, e, stat_g->alloced_adj);
 #else 
-	init_edges_normal(g, stat_g);
+	init_edges_normal(g, stat_g->alloced_adj);
 #endif
 
 	adjust_sink_height(g);
@@ -576,7 +575,6 @@ static void enter_excess(graph_t* g, node_t* v, thread_t* thread)
 		return ;
 	}
 
-	// TODO: Good way to decide which queue to add to. 
 	if (thread->nbr_nodes < LOCAL_QUEUE)
 	{
 		pr("@%d: entering private excess, node = %d, nbr private = %d\n", 
@@ -625,7 +623,6 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 		if (g->excess.waiting == NUM_THREADS || 
 			!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) 
 		{
-			// TODO: recycle threads.
 			pthread_mutex_unlock(&g->excess.mutex);
 			pthread_cond_signal(&g->excess.cond);
 
@@ -635,7 +632,6 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 		else if (g->excess.waiting < NUM_THREADS)
 		{
 			// normal case
-			// TODO: Try busy wait
 			assert(g->excess.waiting <= NUM_THREADS);
 			pr("@%d: waiting, waiting = %d\n", thread->thread_id, g->excess.waiting);
 
@@ -643,9 +639,6 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 			g->excess.waiting -= 1;
 		}
 	}
-
-	// TODO: additional check here for flag? Feels a bit much
-	
 
 	v = g->excess.u;
 
@@ -658,22 +651,22 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 	return v;
 }
 
-static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t* thread)
+static void push(node_t* u, node_t* v, edge_t* e, short dir, int flow, thread_t* thread)
 {
 	/* Assumes you hold all necessary locks */
 
-	if (u == e->u) {
+	if (dir) {
 		e->f += flow;
 	} else {
 		e->f -= flow;
 	}
 
-	pr("@%d: pushing from %d to %d: f = %d, c = %d, d = %d\n", 
-		thread->thread_id, id(g, u), id(g, v), e->f, e->c, flow);
-	count_stat(thread->stats.pushes);
-
 	u->e -= flow;
 	v->e += flow;
+
+	pr("@%d: pushing from %d to %d: fe = %d, eu = %d, ev = %d, c = %d, d = %d\n", 
+		thread->thread_id, id(thread->g, u), id(thread->g, v), e->f, u->e, v->e, e->c, flow);
+	count_stat(thread->stats.pushes);
 
 	/* the following are always true. */
 
@@ -693,15 +686,15 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		 * can now push.
 		 */
 
-		enter_excess(g, v, thread);
+		enter_excess(thread->g, v, thread);
 	} 
 	else if (v->e == 0) {
 		// Must be the sink!
 		pr("@%d: Sink completely filled\n", thread->thread_id);
-		assert(v == g->t);
-		clear_flags(thread->threads);	//TODO: More?
+		assert(v == thread->g->t);
+		clear_flags(thread->threads);
 
-		pthread_cond_broadcast(&g->excess.cond);	// ERROR: maybe wonky
+		pthread_cond_broadcast(&thread->g->excess.cond);	// ERROR: maybe wonky
 	}
 }
 
@@ -718,24 +711,18 @@ static void relabel(graph_t* g, node_t* u, thread_t* thread)
 
 }
 
-static node_t* other(node_t* u, edge_t* e)
-{
-	if (u == e->u)
-		return e->v;
-	else
-		return e->u;
-}
 
 static void source_pushes(graph_t* g, thread_t* thread)
 {
-	list_t* p;
+	adj_t* adj;
 	node_t* s;
 	node_t* v;
 	edge_t* e;
 	int n;
+	int i;
 
 	count_stat(thread->stats.nodes_processed);
-	thread->nbr_nodes += NUM_THREADS*3;		// TODO: Ugly
+	thread->nbr_nodes += NUM_THREADS*3;		// Ugly
 
 	pr("@%d: Starting source pushes\n", thread->thread_id);
 
@@ -744,21 +731,21 @@ static void source_pushes(graph_t* g, thread_t* thread)
 
 	pthread_mutex_lock(&s->mutex);
 	
-	p = s->edge;
+	adj = s->adj;
 
 	// Try to push to all neighbours.
-	while(p != NULL) {
+	for (i = 0; i < s->nbr_edge; i += 1) {
 
-		e = p->edge;
-		p = p->next;
-		v = other(s, e);
+		e = &g->e[adj[i].index];
+		v = &g->v[adj[i].v];
 
 		// Hack to make s have "infinite preflow"
-		s->e += e->c;
+		s->e += e->c;	// TODO: Remove?
 
 		/* helper func tp check if we can push and maybe do it */
-		pr("@%d: Trying source push to %d\n", thread->thread_id, id(g, v));
-		try_push(s, v, e, g, thread);
+		pr("@%d: Trying source push to %d == %d\n", thread->thread_id, id(g, v), adj[i].v);
+		try_push(s, v, e, adj[i].dir, g, thread);
+
 		
 	}
 
@@ -787,7 +774,7 @@ static int xpreflow(graph_t* g, pthread_barrier_t* barrier)
 
 }
 
-static int can_push(node_t* u, node_t* v, edge_t* e)
+static int can_push(node_t* u, node_t* v, edge_t* e, short dir)
 {
 	/* Returns how much u can push to v. Assumes you have observed if u has changed flow over e */
 
@@ -795,13 +782,14 @@ static int can_push(node_t* u, node_t* v, edge_t* e)
 
 	assert(u->e > 0);
 
-	if (u == e->u) {
+	if (dir) {
 		flow = MIN(u->e, e->c - e->f);
+		pr("pos: %d\n", flow);
 	} else {
 		flow = MIN(u->e, e->c + e->f);
+		pr("neg: %d\n", flow);
 	}
 
-	// TODO: Pre-compute u_h and pass around? Should be faster
 	// ERROR: Look out for memory order problems
 	if (flow && atomic_load_explicit(&u->h, memory_order_relaxed) > 
 				atomic_load_explicit(&v->h, memory_order_relaxed)){
@@ -813,15 +801,14 @@ static int can_push(node_t* u, node_t* v, edge_t* e)
 
 }
 
-static void try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread)
+static void try_push(node_t* u, node_t* v, edge_t* e, short dir, graph_t* g, thread_t* thread)
 {
 	/* Tries pushing from u to v, but only if possible.
 	*/
 
 	int flow;
 
-	//TODO: Make height not SC
-	flow = can_push(u, v, e);
+	flow = can_push(u, v, e, dir);
 
 	if (flow)
 	{
@@ -835,13 +822,13 @@ static void try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thre
 		}
 
 		// Push if we can
-		push(g, u, v, e, flow, thread);
+		push(u, v, e, dir, flow, thread);
 
 		pthread_mutex_unlock(&v->mutex);
 	}
 	else
 	{
-		pr("@%d: aborted push from %d to %d\n", thread->thread_id, id(g, u), id(g, v));
+		pr("@%d: aborted push from %d to %d since flow = %d\n", thread->thread_id, id(g, u), id(g, v), flow);
 	}
 }
 
@@ -852,24 +839,28 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 	* Adds new nodes with excess preflow to some queue.
 	*/
 
-	list_t* p;
+	adj_t* adj;
 	edge_t* e;
 	node_t *neigh, *v;
+	int i;
 
 	pthread_mutex_lock(&u->mutex);
 
-	while (u->e > 0) {
+	assert(u->e > 0);
 
-		p = u->edge;
+	while (1) {
+
+		adj = u->adj;
 		// Try to push to all neighbours.
-		while(p != NULL && u->e > 0) {
+		while(adj - u->adj < u->nbr_edge && u->e > 0) {
 
-			e = p->edge;
-			p = p->next;
-			v = other(u, e);
+			e = &g->e[adj->index];
+			v = &g->v[adj->v];
+			
 
 			/* helper func tp check if we can push and maybe do it */
-			try_push(u, v, e, g, thread);
+			try_push(u, v, e, adj->dir, g, thread);
+			adj++;
 			
 		}
 
@@ -888,7 +879,6 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 
 static node_t* leave_excess(graph_t* g, thread_t* thread)
 {
-	// TODO: change from stack?
 	node_t* u;
 
 	if (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed))
@@ -899,7 +889,7 @@ static node_t* leave_excess(graph_t* g, thread_t* thread)
 	{
 		u = leave_global_excess(g, thread);
 
-		pr("@%d: getting global node: %d\n", thread->thread_id, id(g, u));
+		if (u != NULL) {pr("@%d: getting global node: %d\n", thread->thread_id, id(g, u));}
 	}
 	else 
 	{
@@ -917,7 +907,7 @@ static void init_thread(thread_t* thread, init_info_t* init, pthread_barrier_t* 
 						.next = NULL, 
 						.nbr_nodes = 0,
 						.g = NULL,
-						.cont = 1,			//ERROR: Does this work?
+						.cont = 1,	
 						.threads = init->threads,
 #if COLLECT_STATS
 						.stats = {0},
@@ -955,7 +945,7 @@ static void* run(void* arg)
 
 		// Synchronize the threads at the start and end of each graph!
 		pthread_barrier_wait(barrier);
-		g = thread.g;	// TODO: Just use reference in thread?
+		g = thread.g;
 
 		pr("@%d: Starting a new graph with n = %d, m = %d\n", thread.thread_id, g->n, g->m);
 
