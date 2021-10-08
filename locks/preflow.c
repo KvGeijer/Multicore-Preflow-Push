@@ -28,6 +28,11 @@
 #define assert(...)
 #endif
 
+#define assertt(x)	do {	tsuspend.		\
+							assert(x);		\
+							tresume.	\
+					} while (0)
+
 #if PRINT
 pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -112,11 +117,10 @@ struct locked_node_list_t {
 };
 
 struct node_t {
-	atomic_int	h;	/* height.			*/
+	int		h;	/* height.			*/
 	int		e;	/* excess flow.			*/
 	list_t*		edge;	/* adjacency list.		*/
 	node_t*		next;	/* with excess preflow.		*/
-	pthread_mutex_t mutex; 	/* processing lock */
 };
 
 struct edge_t {
@@ -170,7 +174,7 @@ static int id(graph_t* g, node_t* v)
 
 // function definitions
 static void* run(void* arg);
-static void try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread);
+static int try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread);
 static void destroy_graph(graph_t* g);
 
 void error(const char* fmt, ...)
@@ -381,10 +385,6 @@ static void init_static_graph(static_graph_t* stat_g, int n, int m)
 
 	init_threads(stat_g->threads, &stat_g->barrier);
 
-	for (i = 0; i < n; i++) {
-		pthread_mutex_init(&stat_g->v[i].mutex, NULL);
-	}
-
 }
 
 static void update_static_graph(static_graph_t* stat_g, int n, int m)
@@ -395,10 +395,6 @@ static void update_static_graph(static_graph_t* stat_g, int n, int m)
 	// Nodes
 	if (n > stat_g->n){
 		stat_g->v = realloc(stat_g->v, n * sizeof(node_t));
-
-		for (i = stat_g->n; i < n; i++) {
-			pthread_mutex_init(&stat_g->v[i].mutex, NULL);
-		}
 
 		stat_g->n = n;
 
@@ -422,7 +418,7 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 	for (int i = 1; i < g->n; i += 1)
 	{
 		g->v[i].e = 0;
-		atomic_store_explicit(&g->v[i].h, 0, memory_order_relaxed);
+		g->v[i].h = 0;
 		g->v[i].next = NULL;
 		g->v[i].edge = NULL;
 	}
@@ -438,7 +434,7 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 
 	g->s = &g->v[s];
 	g->t = &g->v[t];
-	atomic_store_explicit(&g->s->h, g->n, memory_order_release);
+	g->s->h = g->n;
 
 }
 
@@ -455,7 +451,7 @@ static void adjust_sink_height(graph_t* g)
 	}
 
 	g->t->e = -max_cap;
-	atomic_store_explicit(&g->t->h, -max_cap, memory_order_relaxed);	//Just to save space, could alloc to g instead
+	g->t->h = -max_cap;	//Just to save space, could alloc to g instead
 	// ERROR: Check if this causes error, maybe not cleaned up right.
 
 }
@@ -572,7 +568,7 @@ static void enter_excess(graph_t* g, node_t* v, thread_t* thread)
 
 	// TODO: Better to not read height here? Maybe load in advance? Better to have == sink/source in node thread?
 	// TODO: Remove v == g->t? As it now has so much negative preflow :D
-	if (v == g->t || v == g->s || atomic_load_explicit(&v->h, memory_order_relaxed) >= g->n) {
+	if (v == g->t || v == g->s || v->h >= g->n) {
 		return ;
 	}
 
@@ -658,44 +654,56 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 	return v;
 }
 
-static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t* thread)
+static int push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t* thread)
 {
-	/* Assumes you hold all necessary locks */
+	/* Does not assume any outer synchronization.
+	 * But assumes that if v->e == 0 then it is not active. */
 
-	if (u == e->u) {
-		e->f += flow;
-	} else {
-		e->f -= flow;
+	int ve_old;
+	int ve_new;
+	int ue_new;
+
+	// TODO: evaluate if this should be split up into two or three transactions. OR combined with can_push?
+	__transaction_atomic {
+
+		if (u == e->u) {
+			e->f += flow;
+		} else {
+			e->f -= flow;
+		}
+
+		pr("@%d: pushing from %d to %d: f = %d, c = %d, d = %d\n", 
+			thread->thread_id, id(g, u), id(g, v), e->f, e->c, flow);
+		count_stat(thread->stats.pushes);
+
+		ve_old = v->e;
+
+		u->e -= flow;
+		v->e += flow;
+
+		ue_new = u->e;	// Saved so that we cannot push down to 0, get a push and then continue (still getting added to some work queue -> double worked)
+		ve_new = v->e;
+
+
+		if (abs(e->f) != e->c){
+			count_stat(thread->stats.nonsaturated_pushes);
+		}
+
+		//assert(abs(e->f) <= e->c);
+
 	}
 
-	pr("@%d: pushing from %d to %d: f = %d, c = %d, d = %d\n", 
-		thread->thread_id, id(g, u), id(g, v), e->f, e->c, flow);
-	count_stat(thread->stats.pushes);
+	assert(ue_new >= 0 || u == g->s);
 
-	u->e -= flow;
-	v->e += flow;
+	if (ve_old == 0) {
 
-	/* the following are always true. */
-
-#if COLLECT_STATS
-	if (abs(e->f) != e->c){
-		count_stat(thread->stats.nonsaturated_pushes);
-	}
-#endif
-
-	assert(flow > 0);
-	assert(u->e >= 0 || u == g->s);
-	assert(abs(e->f) <= e->c);
-
-	if (v->e == flow) {
-
-		/* since v has d excess now it had zero before and
-		 * can now push.
+		/* Since we updated v from 0 excess we have activated it
+		 * Must be a bit cautious so that another thread don't keep v in cases where it reaches 0 and immediately gets a push.
 		 */
 
 		enter_excess(g, v, thread);
 	} 
-	else if (v->e == 0) {
+	else if (ve_new == 0) {
 		// Must be the sink!
 		pr("@%d: Sink completely filled\n", thread->thread_id);
 		assert(v == g->t);
@@ -703,15 +711,18 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 
 		pthread_cond_broadcast(&g->excess.cond);	// ERROR: maybe wonky
 	}
+
+	return ue_new;
+
 }
 
 static void relabel(graph_t* g, node_t* u, thread_t* thread)
 {
-	int u_h;
 
 	// Todo: Faster with fetch_add? Okay with both relaxed?
-	u_h = atomic_load_explicit(&u->h, memory_order_relaxed);
-	atomic_store_explicit(&u->h, u_h + 1, memory_order_release);
+	__transaction_atomic {
+		u->h += 1;
+	}
 
 	count_stat(thread->stats.relabels);
 	pr("@%d: relabel %d now h = %d\n", thread->thread_id, id(g, u), u->h);
@@ -742,7 +753,9 @@ static void source_pushes(graph_t* g, thread_t* thread)
 	s = g->s;
 	n = s->h;
 
-	pthread_mutex_lock(&s->mutex);
+	// ERROR: How are things ordered by transactional memory?
+	// By doing this no thread will ever potentially try to add the source to an excess queue as it has e > 0 (or maybe just don't add preflow to it...)
+	s->e += 1;
 	
 	p = s->edge;
 
@@ -761,8 +774,6 @@ static void source_pushes(graph_t* g, thread_t* thread)
 		try_push(s, v, e, g, thread);
 		
 	}
-
-	pthread_mutex_unlock(&s->mutex);
 
 	thread->nbr_nodes -= NUM_THREADS*3;
 
@@ -793,56 +804,60 @@ static int can_push(node_t* u, node_t* v, edge_t* e)
 
 	int flow;
 
-	assert(u->e > 0);
+	// TODO: Take u->e as input so that don't have to be in transaction. (Still has to read edge :/)
 
-	if (u == e->u) {
-		flow = MIN(u->e, e->c - e->f);
-	} else {
-		flow = MIN(u->e, e->c + e->f);
-	}
+	// Transaction is not really needed for the if statement
+	__transaction_atomic {
 
-	// TODO: Pre-compute u_h and pass around? Should be faster
-	// ERROR: Look out for memory order problems
-	if (flow && atomic_load_explicit(&u->h, memory_order_relaxed) > 
-				atomic_load_explicit(&v->h, memory_order_relaxed)){
-		return flow;
-	}
-	else {
-		return 0;
+		//assert(u->e > 0);
+
+		if (u == e->u) {
+			flow = MIN(u->e, e->c - e->f);
+		} else {
+			flow = MIN(u->e, e->c + e->f);
+		}
+
+		// ERROR: Look out for memory order problems
+		if (flow && u->h > v->h) {
+			return flow;
+		}
+		else {
+			return 0;
+		}
+
 	}
 
 }
 
-static void try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread)
+static int try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread)
 {
 	/* Tries pushing from u to v, but only if possible.
 	*/
 
 	int flow;
+	int ue;
 
 	//TODO: Make height not SC
 	flow = can_push(u, v, e);
 
 	if (flow)
 	{
-		// First aquire the locks in the correct order
-		if (v < u) {
-			pthread_mutex_unlock(&u->mutex);
-			pthread_mutex_lock(&v->mutex);
-			pthread_mutex_lock(&u->mutex);
-		} else {
-			pthread_mutex_lock(&v->mutex);
-		}
-
 		// Push if we can
-		push(g, u, v, e, flow, thread);
+		ue = push(g, u, v, e, flow, thread);
 
-		pthread_mutex_unlock(&v->mutex);
 	}
 	else
 	{
+
+		// TODO: Looks bad, should just be able to re-use old value (or if no old the assume > 0 in process)
+		// Could also just set ue = 1 or something greater than 0
+		ue = 1;	// ERROR: Woring if we use the value of ue later
+
 		pr("@%d: aborted push from %d to %d\n", thread->thread_id, id(g, u), id(g, v));
 	}
+
+	return ue;
+
 }
 
 static void process_node(node_t* u, graph_t* g, thread_t* thread)
@@ -855,32 +870,31 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 	list_t* p;
 	edge_t* e;
 	node_t *neigh, *v;
+	int ue;		// The remaining flow of the node, as we don't want too many transactions
 
-	pthread_mutex_lock(&u->mutex);
-
-	while (u->e > 0) {
+	do {
 
 		p = u->edge;
 		// Try to push to all neighbours.
-		while(p != NULL && u->e > 0) {
+		do {
 
 			e = p->edge;
 			p = p->next;
 			v = other(u, e);
 
 			/* helper func tp check if we can push and maybe do it */
-			try_push(u, v, e, g, thread);
+			ue = try_push(u, v, e, g, thread);
 			
-		}
+		} while(p != NULL && ue > 0);
 
-		if (u->e == 0){
+		if (ue == 0){
 			break;
 		}
 
 		relabel(g, u, thread);
-	}
 
-	pthread_mutex_unlock(&u->mutex);
+	} while (ue > 0);
+
 
 }
 
