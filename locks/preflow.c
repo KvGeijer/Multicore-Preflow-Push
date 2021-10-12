@@ -654,43 +654,67 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 	return v;
 }
 
-static int push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t* thread)
+static int push(graph_t* g, node_t* u, node_t* v, edge_t* e, thread_t* thread)
 {
 	/* Does not assume any outer synchronization.
 	 * But assumes that if v->e == 0 then it is not active. */
 
+	int flow;
 	int ve_old;
 	int ve_new;
 	int ue_new;
 
 	// TODO: evaluate if this should be split up into two or three transactions. OR combined with can_push?
+
+
+	// DATA RACE...
+	if (u == e->u) {
+		flow = MIN(u->e, e->c - e->f);
+	} else {
+		flow = MIN(u->e, e->c + e->f);
+	}
+
+	if (flow == 0) {
+		return 1;
+	}
+
+
 	__transaction_atomic {
 
-		if (u == e->u) {
-			e->f += flow;
+		if (u->h > v->h) {
+
+			// Ugly :)
+			if (u == e->u) {
+				e->f += flow;
+			} else {
+				e->f -= flow;
+			}
+
+			
+
+			pr("@%d: pushing from %d to %d: f = %d, c = %d, d = %d\n", 
+				thread->thread_id, id(g, u), id(g, v), e->f, e->c, flow);
+			count_stat(thread->stats.pushes);
+
+			ve_old = v->e;
+
+			u->e -= flow;
+			v->e += flow;
+
+			ue_new = u->e;	// Saved so that we cannot push down to 0, get a push and then continue (still getting added to some work queue -> double worked)
+			ve_new = v->e;
+
+
+			if (abs(e->f) != e->c){
+				count_stat(thread->stats.nonsaturated_pushes);
+			}
+
+			//assert(abs(e->f) <= e->c);
+
 		} else {
-			e->f -= flow;
+			return 1;
 		}
-
-		pr("@%d: pushing from %d to %d: f = %d, c = %d, d = %d\n", 
-			thread->thread_id, id(g, u), id(g, v), e->f, e->c, flow);
-		count_stat(thread->stats.pushes);
-
-		ve_old = v->e;
-
-		u->e -= flow;
-		v->e += flow;
-
-		ue_new = u->e;	// Saved so that we cannot push down to 0, get a push and then continue (still getting added to some work queue -> double worked)
-		ve_new = v->e;
-
-
-		if (abs(e->f) != e->c){
-			count_stat(thread->stats.nonsaturated_pushes);
-		}
-
-		//assert(abs(e->f) <= e->c);
-
+		
 	}
 
 	assert(ue_new >= 0 || u == g->s);
@@ -798,65 +822,12 @@ static int xpreflow(graph_t* g, pthread_barrier_t* barrier)
 
 }
 
-static int can_push(node_t* u, node_t* v, edge_t* e)
-{
-	/* Returns how much u can push to v. Assumes you have observed if u has changed flow over e */
-
-	int flow;
-
-	// TODO: Take u->e as input so that don't have to be in transaction. (Still has to read edge :/)
-
-	// Transaction is not really needed for the if statement
-	__transaction_atomic {
-
-		//assert(u->e > 0);
-
-		if (u == e->u) {
-			flow = MIN(u->e, e->c - e->f);
-		} else {
-			flow = MIN(u->e, e->c + e->f);
-		}
-
-		// ERROR: Look out for memory order problems
-		if (flow && u->h > v->h) {
-			return flow;
-		}
-		else {
-			return 0;
-		}
-
-	}
-
-}
-
 static int try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thread)
 {
 	/* Tries pushing from u to v, but only if possible.
 	*/
 
-	int flow;
-	int ue;
-
-	//TODO: Make height not SC
-	flow = can_push(u, v, e);
-
-	if (flow)
-	{
-		// Push if we can
-		ue = push(g, u, v, e, flow, thread);
-
-	}
-	else
-	{
-
-		// TODO: Looks bad, should just be able to re-use old value (or if no old the assume > 0 in process)
-		// Could also just set ue = 1 or something greater than 0
-		ue = 1;	// ERROR: Woring if we use the value of ue later
-
-		pr("@%d: aborted push from %d to %d\n", thread->thread_id, id(g, u), id(g, v));
-	}
-
-	return ue;
+	return push(g, u, v, e, thread);
 
 }
 
@@ -870,7 +841,7 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 	list_t* p;
 	edge_t* e;
 	node_t *neigh, *v;
-	int ue;		// The remaining flow of the node, as we don't want too many transactions
+	int u_left;		// The remaining flow of the node, as we don't want too many transactions
 
 	do {
 
@@ -883,17 +854,17 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 			v = other(u, e);
 
 			/* helper func tp check if we can push and maybe do it */
-			ue = try_push(u, v, e, g, thread);
+			u_left = try_push(u, v, e, g, thread);
 			
-		} while(p != NULL && ue > 0);
+		} while(p != NULL && u_left);
 
-		if (ue == 0){
+		if (!u_left){
 			break;
 		}
 
 		relabel(g, u, thread);
 
-	} while (ue > 0);
+	} while (1);
 
 
 }
