@@ -10,12 +10,12 @@
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
 #define PRINT		0	/* enable/disable prints. */
 #define NUM_THREADS 20
-#define LOCAL_QUEUE 2
+#define LOCAL_QUEUE 3
 
 /************** MEMORY CONSTANTS **************/
 
-#define MEMORY_UPDATE		2
-#define STARTING_ADJ		300		// TODO
+#define MEMORY_UPDATE		1.5
+#define STARTING_ADJ		1200		// TODO
 
 /**********************************************/
 
