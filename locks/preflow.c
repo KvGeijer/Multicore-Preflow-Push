@@ -8,11 +8,11 @@
 #include <stdatomic.h>
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
-#define PRINT		0	/* enable/disable prints. */
+#define PRINT		1	/* enable/disable prints. */
 #define NUM_THREADS 20
 #define LOCAL_QUEUE 2
 
-#define FORSETE		1
+#define FORSETE		0
 #define NDEBUG
 
 #include <assert.h>
@@ -40,16 +40,6 @@ pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 #define MIN(a,b)	(((a)<=(b))?(a):(b))
-
-
-/* introduce names for some structs. a struct is like a class, except
- * it cannot be extended and has no member methods, and everything is
- * public.
- *
- * using typedef like this means we can avoid writing 'struct' in 
- * every declaration. no new type is introduded and only a shorter name.
- *
- */
 
 typedef struct graph_t	graph_t;
 typedef struct node_t	node_t;
@@ -105,7 +95,7 @@ struct list_t {
 
 struct locked_node_list_t {
 	short waiting;
-	int size;
+	atomic_int isempty;
 	node_t* u;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
@@ -286,7 +276,7 @@ static void init_lockedList(locked_node_list_t* list)
 	pthread_cond_init(&list->cond, NULL);
 
 	list->u = NULL;
-	list->size = 0;
+	atomic_store_explicit(&list->isempty, 1, memory_order_relaxed);
 	list->waiting = 0;
 }
 
@@ -553,10 +543,9 @@ static void enter_global_excess(graph_t* g, node_t* v)
 
 	v->next = g->excess.u;
 	g->excess.u = v;
-	g->excess.size += 1;
+	atomic_store_explicit(&g->excess.isempty, 0, memory_order_relaxed);
 
 	pthread_mutex_unlock(&g->excess.mutex);
-	pthread_cond_signal(&g->excess.cond);
 
 }
 
@@ -612,7 +601,11 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 	node_t*		v;
 
 	/* take any u from the set of nodes with excess preflow
-	 * and for simplicity we always take the first.
+	 * and for simplicity (and speed) we always take the first.
+	 *
+	 * Takes lock and tries to fetch element. If empty it releases
+	 * the lock and busy waits intil the list is not empty,
+	 * or until the algorithm has terminated.
 	 * 
 	 */
 
@@ -621,36 +614,42 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 	while (g->excess.u == NULL)
 	{
 		g->excess.waiting += 1;
+		pr("@%d: waiting, waiting = %d\n", thread->thread_id, g->excess.waiting);
 
-		if (g->excess.waiting == NUM_THREADS || 
-			!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) 
-		{
-			// TODO: recycle threads.
+		if (g->excess.waiting == NUM_THREADS) {
+			/* All threads are waiting, meaning there are no more active nodes */
+
 			pthread_mutex_unlock(&g->excess.mutex);
-			pthread_cond_signal(&g->excess.cond);
-
+			clear_flags(thread->threads);
 			pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
 			return NULL;
 		}
-		else if (g->excess.waiting < NUM_THREADS)
-		{
-			// normal case
-			// TODO: Try busy wait
-			assert(g->excess.waiting <= NUM_THREADS);
-			pr("@%d: waiting, waiting = %d\n", thread->thread_id, g->excess.waiting);
+		else {
+			// Busy wait until either the queue is not empty or your flag has been set.
+			// Even if queue is not empty it can be when you take the lock, so therefore in a while loop.
 
-			pthread_cond_wait(&g->excess.cond, &g->excess.mutex);
-			g->excess.waiting -= 1;
+			pthread_mutex_unlock(&g->excess.mutex);
+
+			// Ugly
+			while (atomic_load_explicit(&g->excess.isempty, memory_order_relaxed)) 
+			{
+				if (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) {
+					pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
+					return NULL;
+				}
+			}
+			if (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) {
+				pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
+				return NULL;
+			}
+			pthread_mutex_lock(&g->excess.mutex);
 		}
+
+		g->excess.waiting -= 1;
 	}
 
-	// TODO: additional check here for flag? Feels a bit much
-	
-
 	v = g->excess.u;
-
 	g->excess.u = v->next;
-	g->excess.size -= 1;
 
 	pthread_mutex_unlock(&g->excess.mutex);
 
@@ -700,8 +699,6 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 		pr("@%d: Sink completely filled\n", thread->thread_id);
 		assert(v == g->t);
 		clear_flags(thread->threads);	//TODO: More?
-
-		pthread_cond_broadcast(&g->excess.cond);	// ERROR: maybe wonky
 	}
 }
 
@@ -936,6 +933,7 @@ static void reset_thread(thread_t* thread)
 {
 	thread->nbr_nodes = 0;
 	thread->next = NULL;
+	atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed);
 }
 
 static void* run(void* arg)
