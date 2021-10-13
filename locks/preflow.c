@@ -8,7 +8,7 @@
 #include <stdatomic.h>
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
-#define PRINT		1	/* enable/disable prints. */
+#define PRINT		0	/* enable/disable prints. */
 #define NUM_THREADS 20
 #define LOCAL_QUEUE 2
 
@@ -98,7 +98,6 @@ struct locked_node_list_t {
 	atomic_int isempty;
 	node_t* u;
 	pthread_mutex_t mutex;
-	pthread_cond_t cond;
 };
 
 struct node_t {
@@ -273,7 +272,6 @@ static void init_lockedList(locked_node_list_t* list)
 	//TODO: Assign statically?
 
 	pthread_mutex_init(&list->mutex, NULL);
-	pthread_cond_init(&list->cond, NULL);
 
 	list->u = NULL;
 	atomic_store_explicit(&list->isempty, 1, memory_order_relaxed);
@@ -983,7 +981,6 @@ static void destroy_graph(graph_t* g)
 {
 	// Very sad now that almost nothing is free'd	
 
-	pthread_cond_destroy(&g->excess.cond);
 	pthread_mutex_destroy(&g->excess.mutex);
 
 }
