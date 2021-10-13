@@ -45,7 +45,8 @@ typedef struct graph_t	graph_t;
 typedef struct node_t	node_t;
 typedef struct edge_t	edge_t;
 typedef struct list_t	list_t;
-typedef struct locked_node_list_t	locked_node_list_t;
+typedef struct node_stack_t	node_stack_t;
+typedef struct stack_pointer_t	stack_pointer_t;
 typedef struct thread_t thread_t;
 typedef struct init_info_t init_info_t;
 typedef struct stats_t stats_t;
@@ -93,11 +94,15 @@ struct list_t {
 	list_t*		next;
 };
 
-struct locked_node_list_t {
-	short waiting;
-	atomic_int isempty;
-	node_t* u;
-	pthread_mutex_t mutex;
+struct stack_pointer_t {
+	node_t*		node;
+	int		id;
+};
+
+struct node_stack_t {
+	_Atomic stack_pointer_t 	top;
+	atomic_int 				count;		// TODO: Change to int? Needs to be atomic?
+	atomic_int 				waiting;
 };
 
 struct node_t {
@@ -124,7 +129,7 @@ struct graph_t {
 	node_t*		t;	/* sink.			*/
 
 	// TODO: Move the excess list and threads somewhere else?
-	locked_node_list_t excess;	/* nodes with e > 0 except s,t.	*/
+	node_stack_t excess;	/* nodes with e > 0 except s,t.	*/
 };
 
 struct static_graph_t {
@@ -237,6 +242,51 @@ static void print_stats(thread_t* thread)
 #endif
 }
 
+
+/********************* ATOMIC STACK ********************/
+
+static void stack_push(node_stack_t* stack, node_t* u)
+{
+	stack_pointer_t new_top;
+	stack_pointer_t old_top;
+
+	old_top = atomic_load_explicit(&stack->top, memory_order_relaxed);
+
+	new_top.node = u;
+	new_top.id = atomic_fetch_add_explicit(&stack->count, 1, memory_order_relaxed);
+
+	do {
+		new_top.node->next = old_top.node;
+	} while(!atomic_compare_exchange_weak_explicit(&stack->top, &old_top, new_top, 
+			memory_order_release, memory_order_relaxed));
+
+}
+
+static node_t* stack_pop_nonblocking(node_stack_t* stack)
+{
+	stack_pointer_t new_top;
+	stack_pointer_t old_top;
+
+	old_top = atomic_load_explicit(&stack->top, memory_order_relaxed);
+
+	do {
+		if (old_top.node != NULL) {
+			
+			new_top.node = old_top.node->next;
+
+		} else {
+			break;
+		}
+
+	} while(!atomic_compare_exchange_weak_explicit(&stack->top, &old_top, new_top, 
+			memory_order_release, memory_order_relaxed));
+
+	return old_top.node;
+
+}
+
+/*******************************************************/
+
 static void add_edge(node_t* u, edge_t* e, list_t* p)
 {
 
@@ -266,16 +316,12 @@ static void connect(node_t* u, node_t* v, int c, edge_t* e, list_t* link1, list_
 	add_edge(v, e, link2);
 }
 
-static void init_lockedList(locked_node_list_t* list)
+static void init_wait_stack(node_stack_t* list)
 {
 
 	//TODO: Assign statically?
+	memset(list, 0, sizeof *list);
 
-	pthread_mutex_init(&list->mutex, NULL);
-
-	list->u = NULL;
-	atomic_store_explicit(&list->isempty, 1, memory_order_relaxed);
-	list->waiting = 0;
 }
 
 static void init_edges_forsete(graph_t* g, xedge_t* e, static_graph_t* stat_g)
@@ -488,7 +534,7 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 	link_and_reset_graph(g, stat_g, s, t);
 	// TODO: Use OpenMP to divide into sections and parallelize loops
 
-	init_lockedList(&g->excess);
+	init_wait_stack(&g->excess);
 
 #if (FORSETE)
 	init_edges_forsete(g, e, stat_g);
@@ -506,7 +552,6 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 static void clear_flags(thread_t** threads)
 {
 	int i;
-	pr("CLEARING FLAGS\n");
 
 	for (i = 0; i < NUM_THREADS; i += 1)
 	{
@@ -537,13 +582,7 @@ static void enter_global_excess(graph_t* g, node_t* v)
 	 * Atm just Lifo queue, but maybe Fifo better?
 	 */
 
-	pthread_mutex_lock(&g->excess.mutex);
-
-	v->next = g->excess.u;
-	g->excess.u = v;
-	atomic_store_explicit(&g->excess.isempty, 0, memory_order_relaxed);
-
-	pthread_mutex_unlock(&g->excess.mutex);
+	stack_push(&g->excess, v);
 
 }
 
@@ -601,58 +640,46 @@ static node_t* leave_global_excess(graph_t* g, thread_t* thread)
 	/* take any u from the set of nodes with excess preflow
 	 * and for simplicity (and speed) we always take the first.
 	 *
-	 * Takes lock and tries to fetch element. If empty it releases
-	 * the lock and busy waits intil the list is not empty,
-	 * or until the algorithm has terminated.
+	 * Now uses the atomic stack Jonas presented in his lecture.
+	 * If the stack is empty it enters a block where if all threads
+	 * are there waiting it clears all flags and returns NULL and
+	 * otherwise it repeatedly tried to pop a node until it gets one
+	 * or its flag is cleared.
 	 * 
 	 */
 
-	pthread_mutex_lock(&g->excess.mutex);
+	v = stack_pop_nonblocking(&g->excess);
 
-	while (g->excess.u == NULL)
+	if (v != NULL) 
 	{
-		g->excess.waiting += 1;
-		pr("@%d: waiting, waiting = %d\n", thread->thread_id, g->excess.waiting);
+		// Hot path is just returning the node
+		return v;
 
-		if (g->excess.waiting == NUM_THREADS) {
-			/* All threads are waiting, meaning there are no more active nodes */
+	}
+	else {
+		int waiting = atomic_fetch_add_explicit(&g->excess.waiting, 1, memory_order_relaxed) + 1;
 
-			pthread_mutex_unlock(&g->excess.mutex);
-			clear_flags(thread->threads);
-			pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
-			return NULL;
-		}
-		else {
-			// Busy wait until either the queue is not empty or your flag has been set.
-			// Even if queue is not empty it can be when you take the lock, so therefore in a while loop.
-
-			pthread_mutex_unlock(&g->excess.mutex);
-
-			// Ugly
-			while (atomic_load_explicit(&g->excess.isempty, memory_order_relaxed)) 
+		if (waiting != NUM_THREADS) 
+		{
+			// Try to get a node until you get one or your flag is cleared.
+			while (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) 
 			{
-				if (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) {
-					pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
-					return NULL;
+				v = stack_pop_nonblocking(&g->excess);
+				if (v != NULL) 
+				{
+					return v;
 				}
 			}
-			if (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) {
-				pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
-				return NULL;
-			}
-			pthread_mutex_lock(&g->excess.mutex);
+
+			pr("@%d: flag cleared so returning NULL, waiting = %d\n", thread->thread_id);
+			return NULL;
+
+		} else {
+			clear_flags(thread->threads);
+			pr("@%d: clearing flags and returning NULL, waiting = %d\n", thread->thread_id, waiting);
+			return NULL;
 		}
-
-		g->excess.waiting -= 1;
 	}
-
-	v = g->excess.u;
-	g->excess.u = v->next;
-
-	pthread_mutex_unlock(&g->excess.mutex);
-
-	count_stat(thread->stats.central_pops);
-	return v;
 }
 
 static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t* thread)
@@ -979,9 +1006,7 @@ static void* run(void* arg)
 
 static void destroy_graph(graph_t* g)
 {
-	// Very sad now that almost nothing is free'd	
-
-	pthread_mutex_destroy(&g->excess.mutex);
+	// Lol
 
 }
 
@@ -1023,4 +1048,3 @@ int main(int argc, char* argv[])
 
 }
 #endif
-
