@@ -9,7 +9,7 @@
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
 #define PRINT		0	/* enable/disable prints. */
-#define NUM_THREADS 20
+#define NUM_THREADS 26
 #define LOCAL_QUEUE 2
 
 #define FORSETE		1
@@ -114,6 +114,7 @@ struct locked_node_list_t {
 struct node_t {
 	atomic_int	h;	/* height.			*/
 	int		e;	/* excess flow.			*/
+	list_t* 	progress;
 	list_t*		edge;	/* adjacency list.		*/
 	node_t*		next;	/* with excess preflow.		*/
 	pthread_mutex_t mutex; 	/* processing lock */
@@ -425,6 +426,7 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 		atomic_store_explicit(&g->v[i].h, 0, memory_order_relaxed);
 		g->v[i].next = NULL;
 		g->v[i].edge = NULL;
+		g->v[i].progress = NULL;
 	}
 	g->v[0].e = 0;
 	g->v[0].edge = NULL;	// TODO: Where is s.h updated?
@@ -858,11 +860,21 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 
 	pthread_mutex_lock(&u->mutex);
 
+	if (u->progress == NULL) {
+		p = u->edge;
+	} 
+	else {
+		//p = u->edge;
+		p = u->progress;
+	}
+
+
 	while (u->e > 0) {
 
-		p = u->edge;
+		
 		// Try to push to all neighbours.
 		while(p != NULL && u->e > 0) {
+			u->progress = p;
 
 			e = p->edge;
 			p = p->next;
@@ -878,6 +890,7 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 		}
 
 		relabel(g, u, thread);
+		p = u->edge;
 	}
 
 	pthread_mutex_unlock(&u->mutex);
