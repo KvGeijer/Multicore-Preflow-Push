@@ -9,7 +9,7 @@
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
 #define PRINT		0	/* enable/disable prints. */
-#define NUM_THREADS 26
+#define NUM_THREADS 20
 #define LOCAL_QUEUE 2
 
 #define FORSETE		1
@@ -41,16 +41,6 @@ pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define MIN(a,b)	(((a)<=(b))?(a):(b))
 
-
-/* introduce names for some structs. a struct is like a class, except
- * it cannot be extended and has no member methods, and everything is
- * public.
- *
- * using typedef like this means we can avoid writing 'struct' in 
- * every declaration. no new type is introduded and only a shorter name.
- *
- */
-
 typedef struct graph_t	graph_t;
 typedef struct node_t	node_t;
 typedef struct edge_t	edge_t;
@@ -79,8 +69,9 @@ struct stats_t {
 
 struct thread_t {
 	short thread_id;
-	short nbr_nodes;
-	node_t* next;	/* Private work queue */
+	node_t*		in;		/* Inqueue for nect processing.		*/
+	node_t*		out;	/* Outqueue to either push to global to replace inqueue	(Andersson and Setubal 1995)*/
+	int 	nbr_out;	/* How many nodes are in the out queue? */
 
 	atomic_flag cont;
 	graph_t* g;
@@ -104,20 +95,21 @@ struct list_t {
 };
 
 struct locked_node_list_t {
-	short waiting;
-	int size;
-	node_t* u;
 	pthread_mutex_t mutex;
 	pthread_cond_t cond;
+	node_t* u;
+	int size;
+	short waiting;
 };
 
 struct node_t {
-	atomic_int	h;	/* height.			*/
-	int		e;	/* excess flow.			*/
-	list_t* 	progress;
-	list_t*		edge;	/* adjacency list.		*/
-	node_t*		next;	/* with excess preflow.		*/
 	pthread_mutex_t mutex; 	/* processing lock */
+	list_t* 	progress;	/* To what edge we got last time processing this node */
+	list_t*		edge;	/* adjacency list.		*/
+	node_t* 	next;	/* For forming linked lists, should probaby be arrays of some sort */
+	atomic_int	h;		/* height.			*/
+	int		e;			/* excess flow.			*/
+	int 	lowest_neigh;	/* Height of the lowest neighbour */
 };
 
 struct edge_t {
@@ -128,6 +120,7 @@ struct edge_t {
 };
 
 struct graph_t {
+	int 	b; 	/* How much to fetch and push at a time when accessing queues */
 	int		n;	/* nodes.			*/
 	int		m;	/* edges.			*/
 	node_t*		v;	/* array of n nodes.		*/
@@ -135,7 +128,6 @@ struct graph_t {
 	node_t*		s;	/* source.			*/
 	node_t*		t;	/* sink.			*/
 
-	// TODO: Move the excess list and threads somewhere else?
 	locked_node_list_t excess;	/* nodes with e > 0 except s,t.	*/
 };
 
@@ -147,7 +139,7 @@ struct static_graph_t {
 	edge_t* e;
 	list_t* links;
 
-	thread_t** threads;	// TODO: Test changing to an array of pointers
+	thread_t** threads;
 	pthread_barrier_t barrier;
 };
 
@@ -361,7 +353,6 @@ static void init_threads(thread_t** threads, pthread_barrier_t* barrier)
 	
 	pr("MAIN: Waiting from thread links\n");
 	pthread_barrier_wait(barrier);
-	pr("MAIN: thread_t thread_index at index 1: %d\n", threads[1]->thread_id);
 
 }
 
@@ -424,12 +415,13 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 	{
 		g->v[i].e = 0;
 		atomic_store_explicit(&g->v[i].h, 0, memory_order_relaxed);
-		g->v[i].next = NULL;
 		g->v[i].edge = NULL;
 		g->v[i].progress = NULL;
+		g->v[i].lowest_neigh = 0;
+		g->v[i].next = NULL;
 	}
 	g->v[0].e = 0;
-	g->v[0].edge = NULL;	// TODO: Where is s.h updated?
+	g->v[0].edge = NULL;
 
 
 	g->e = stat_g->e;
@@ -457,8 +449,8 @@ static void adjust_sink_height(graph_t* g)
 	}
 
 	g->t->e = -max_cap;
-	atomic_store_explicit(&g->t->h, -max_cap, memory_order_relaxed);	//Just to save space, could alloc to g instead
-	// ERROR: Check if this causes error, maybe not cleaned up right.
+	atomic_store_explicit(&g->t->h, -max_cap, memory_order_relaxed);	
+	//Just to save space, could alloc to g instead
 
 }
 
@@ -468,8 +460,6 @@ static void prepare_threads(graph_t* g, thread_t** threads)
 	for (int i = 0; i < NUM_THREADS; i += 1){
 		thread = threads[i];
 		thread->g = g;
-		pr("prepping: %d, %d = %d = %d\n", i, g->n, threads[i]->g->n, thread->g->n);
-		// ERROR: Do we need more here? Is the flag already set?
 	}
 }
 
@@ -488,6 +478,7 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 
 	g->n = n;
 	g->m = m;
+	g->b = 4;
 
 	if (stat_g != NULL) 
 	{
@@ -529,135 +520,188 @@ static void clear_flags(thread_t** threads)
 	}
 }
 
-static void enter_private_excess(node_t* v, thread_t* thread)
+static void enter_outqueue(node_t* v, thread_t* thread)
 {
-	/* Enter the node v into the private work queue.
-	 * 
-	 * Atm just Lifo queue, but maybe Fifo better?
-	 * 
-	 * Really does not need you to hold the lock for v. But so fast...
+	/* Enter the node v into the private outqueue
 	 */
 
-	v->next = thread->next;
-	thread->next = v;
-	thread->nbr_nodes += 1;
+	if (thread->out != NULL) {
+		v->next = thread->out->next;
+		thread->out->next = v;
+	} else {
+		v->next = v;
+	}
+
+	thread->out = v;
+	thread->nbr_out += 1;
 
 }
 
-static void enter_global_excess(graph_t* g, node_t* v)
+static void publish_outqueue(graph_t* g, thread_t* thread)
 {
-	/* Enter the node v into the global work queue.
-	 * 
-	 * Atm just Lifo queue, but maybe Fifo better?
+	/* Append the nodes in the outqueue to the global excess list.
 	 */
+
+	node_t* first;
 
 	pthread_mutex_lock(&g->excess.mutex);
 
-	v->next = g->excess.u;
-	g->excess.u = v;
-	g->excess.size += 1;
+	if (g->excess.u != NULL) {
+		first = g->excess.u->next;
+
+		g->excess.u->next = thread->out->next;
+		thread->out->next = first;
+		
+		
+	} else {
+		// TODO: Maybe signal here?
+	}
+
+	g->excess.u = thread->out;
 
 	pthread_mutex_unlock(&g->excess.mutex);
 	pthread_cond_signal(&g->excess.cond);
+
+	thread->nbr_out = 0;
+	thread->out = NULL;
 
 }
 
 static void enter_excess(graph_t* g, node_t* v, thread_t* thread)
 {
-	/* Put v into a work queue depending on circumstance.
-	 *
-	 * Atm you hold the lock for v, but do you have to?
-	 * 
+	/* Put v into the outqueue and maybe publish it
 	 */
 
 	assert(v->e > 0);
 
-	// TODO: Better to not read height here? Maybe load in advance? Better to have == sink/source in node thread?
-	// TODO: Remove v == g->t? As it now has so much negative preflow :D
+	// TODO: Remove v == g->t? As it now has so much negative preflow :D Also g->s should be removed
 	if (v == g->t || v == g->s || atomic_load_explicit(&v->h, memory_order_relaxed) >= g->n) {
 		return ;
 	}
 
-	// TODO: Good way to decide which queue to add to. 
-	if (thread->nbr_nodes < LOCAL_QUEUE)
-	{
-		pr("@%d: entering private excess, node = %d, nbr private = %d\n", 
-			thread->thread_id, id(g, v), thread->nbr_nodes);
+	pr("@%d: entering node into outqueue, node = %d, nbr out = %d\n", thread->thread_id, id(g, v), thread->nbr_out);
+	enter_outqueue(v, thread);
 
-		enter_private_excess(v, thread);
-	}
-	else 
-	{
-		
-		pr("@%d: entering global excess, node = %d, nbr private = %d\n", 
-			thread->thread_id, id(g, v), thread->nbr_nodes);
+	if (thread->nbr_out >= g->b) {
+		assert(thread->nbr_out == g->b);
 
-		enter_global_excess(g, v);
+		pr("@%d: publishing outqueue, nbr out = %d\n", thread->thread_id, thread->nbr_out);
+		publish_outqueue(g, thread);
 	}
 	
 }
 
-static node_t* leave_private_excess(thread_t* thread)
+static node_t* pop_inqueue(thread_t* thread)
 {
+	/* Pop a node from the private inqueue, It should be in the form of a stack. */
+
 	node_t* u;
 
-	u = thread->next;
-	thread->next = u->next;
-	thread->nbr_nodes -= 1;
+	u = thread->in;
+	thread->in = thread->in->next;
 
 	assert(u != NULL);
 	return u;
 }
 
-static node_t* leave_global_excess(graph_t* g, thread_t* thread)
+static void move_out_to_in(thread_t* thread)
 {
-	node_t*		v;
+	assert(thread->out !=NULL);
 
+	thread->in = thread->out->next;
+
+	thread->out->next = NULL;
+	thread->out = NULL;
+	thread->nbr_out = 0;
+
+}
+
+static node_t* refill_inqueue(thread_t* thread)
+{
 	/* take any u from the set of nodes with excess preflow
 	 * and for simplicity we always take the first.
 	 * 
 	 */
 
+	node_t*		u;
+	node_t*		temp;
+	graph_t* 	g;
+	int 		i;
+
+	g = thread->g;
+	assert(thread->in == NULL);
+
 	pthread_mutex_lock(&g->excess.mutex);
 
-	while (g->excess.u == NULL)
+	// TODO: FIX
+	if (g->excess.u == NULL) 
 	{
-		g->excess.waiting += 1;
 
-		if (g->excess.waiting == NUM_THREADS || 
-			!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) 
-		{
-			// TODO: recycle threads.
+		// If global queue is empty we instead try to take from our outqueue.
+		if (thread->out != NULL) {
 			pthread_mutex_unlock(&g->excess.mutex);
-			pthread_cond_signal(&g->excess.cond);
 
-			pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
-			return NULL;
+			pr("@%d: moving out to in\n", thread->thread_id);
+			move_out_to_in(thread);
+			pr("@%d: moved out to in\n", thread->thread_id);
+			return pop_inqueue(thread);
 		}
-		else if (g->excess.waiting < NUM_THREADS)
+
+		g->excess.waiting += 1;
+		while (g->excess.u == NULL)
 		{
-			// normal case
-			// TODO: Try busy wait
-			assert(g->excess.waiting <= NUM_THREADS);
-			pr("@%d: waiting, waiting = %d\n", thread->thread_id, g->excess.waiting);
 
-			pthread_cond_wait(&g->excess.cond, &g->excess.mutex);
-			g->excess.waiting -= 1;
+			if (g->excess.waiting == NUM_THREADS || 
+				!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed)) 
+			{
+				pthread_mutex_unlock(&g->excess.mutex);
+				pthread_cond_signal(&g->excess.cond);	// TODO: only signal when clearning flags?
+
+				pr("@%d: returning NULL, waiting = %d\n", thread->thread_id, g->excess.waiting);
+				return NULL;
+			}
+			else if (g->excess.waiting < NUM_THREADS)
+			{
+				// normal case
+				// TODO: Try busy wait
+				assert(g->excess.waiting <= NUM_THREADS);
+				pr("@%d: waiting, waiting = %d\n", thread->thread_id, g->excess.waiting);
+
+				pthread_cond_wait(&g->excess.cond, &g->excess.mutex);
+				
+			}
 		}
+		g->excess.waiting -= 1;
 	}
-
-	// TODO: additional check here for flag? Feels a bit much
 	
 
-	v = g->excess.u;
+	if (g->excess.size > g->b) {
+		
+		temp = g->excess.u;
+		u = g->excess.u->next;
 
-	g->excess.u = v->next;
-	g->excess.size -= 1;
+		for (i = 0; i < g->b; i += 1) {
+			// Move temp forward to the last node to fetch
+			temp = temp->next;
+			assert(temp != u);
+		}
+
+		g->excess.u->next = temp->next;
+		temp->next = NULL; 	// Make it a stack representing a portion of the FIFO queue
+
+	}
+	else {
+		// If we fetched the last elements in the queue we have to empty it properly
+		u = g->excess.u->next;
+		g->excess.u->next = NULL;	// Make it a stack
+		g->excess.u = NULL;
+	}
 
 	pthread_mutex_unlock(&g->excess.mutex);
 
 	count_stat(thread->stats.central_pops);
-	return v;
+	thread->in = u->next;
+	return u;
 }
 
 static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t* thread)
@@ -709,11 +753,16 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 
 static void relabel(graph_t* g, node_t* u, thread_t* thread)
 {
-	int u_h;
+	/* Assumes we hold the lock for u */
 
-	// Todo: Faster with fetch_add? Okay with both relaxed?
-	u_h = atomic_load_explicit(&u->h, memory_order_relaxed);
-	atomic_store_explicit(&u->h, u_h + 1, memory_order_release);
+	int u_h;
+	int new_h;
+
+	//u_h = atomic_load_explicit(&u->h, memory_order_relaxed);
+
+	new_h = u->lowest_neigh + 1;
+	atomic_store_explicit(&u->h, new_h, memory_order_release);
+	u->lowest_neigh = g->n;
 
 	count_stat(thread->stats.relabels);
 	pr("@%d: relabel %d now h = %d\n", thread->thread_id, id(g, u), u->h);
@@ -737,7 +786,6 @@ static void source_pushes(graph_t* g, thread_t* thread)
 	int n;
 
 	count_stat(thread->stats.nodes_processed);
-	thread->nbr_nodes += NUM_THREADS*3;		// TODO: Ugly
 
 	pr("@%d: Starting source pushes\n", thread->thread_id);
 
@@ -766,8 +814,6 @@ static void source_pushes(graph_t* g, thread_t* thread)
 
 	pthread_mutex_unlock(&s->mutex);
 
-	thread->nbr_nodes -= NUM_THREADS*3;
-
 }
 
 
@@ -794,6 +840,8 @@ static int can_push(node_t* u, node_t* v, edge_t* e)
 	/* Returns how much u can push to v. Assumes you have observed if u has changed flow over e */
 
 	int flow;
+	int uh;
+	int vh;
 
 	assert(u->e > 0);
 
@@ -805,13 +853,22 @@ static int can_push(node_t* u, node_t* v, edge_t* e)
 
 	// TODO: Pre-compute u_h and pass around? Should be faster
 	// ERROR: Look out for memory order problems
-	if (flow && atomic_load_explicit(&u->h, memory_order_relaxed) > 
-				atomic_load_explicit(&v->h, memory_order_relaxed)){
-		return flow;
+	if (flow)
+	{
+		uh = atomic_load_explicit(&u->h, memory_order_relaxed);
+		vh = atomic_load_explicit(&v->h, memory_order_consume);	// TODO: try relaxed
+		
+		if  (uh > vh) {
+			return flow;
+		}
+		else if (vh < u->lowest_neigh) {
+			u->lowest_neigh = vh;
+		}
+		
 	}
-	else {
-		return 0;
-	}
+	
+	return 0;
+	
 
 }
 
@@ -855,8 +912,9 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 	*/
 
 	list_t* p;
+	list_t* prog;
 	edge_t* e;
-	node_t *neigh, *v;
+	node_t *v;
 
 	pthread_mutex_lock(&u->mutex);
 
@@ -864,7 +922,6 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 		p = u->edge;
 	} 
 	else {
-		//p = u->edge;
 		p = u->progress;
 	}
 
@@ -874,7 +931,7 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 		
 		// Try to push to all neighbours.
 		while(p != NULL && u->e > 0) {
-			u->progress = p;
+			prog = p;
 
 			e = p->edge;
 			p = p->next;
@@ -893,6 +950,8 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 		p = u->edge;
 	}
 
+
+	u ->progress = prog;
 	pthread_mutex_unlock(&u->mutex);
 
 }
@@ -904,21 +963,23 @@ static node_t* leave_excess(graph_t* g, thread_t* thread)
 	// TODO: change from stack?
 	node_t* u;
 
-	if (!atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed))
+	if (atomic_flag_test_and_set_explicit(&thread->cont, memory_order_relaxed))
 	{
+		if (thread->in != NULL) 
+		{
+			u = pop_inqueue(thread);
+
+			pr("@%d: getting private node: %d\n", thread->thread_id, id(g, u));
+		}
+		else 
+		{
+			u = refill_inqueue(thread);
+
+			pr("@%d: refilling inqueue and getting: %d\n", thread->thread_id, id(g, u));
+		}
+	} 
+	else {
 		return NULL;
-	}
-	else if (thread->next == NULL) 
-	{
-		u = leave_global_excess(g, thread);
-
-		pr("@%d: getting global node: %d\n", thread->thread_id, id(g, u));
-	}
-	else 
-	{
-		u = leave_private_excess(thread);
-
-		pr("@%d: getting private node: %d\n", thread->thread_id, id(g, u));
 	}
 
 	return u;
@@ -927,8 +988,9 @@ static node_t* leave_excess(graph_t* g, thread_t* thread)
 static void init_thread(thread_t* thread, init_info_t* init, pthread_barrier_t* barrier)
 {
 	*thread = (thread_t){	.thread_id = init->thread_id, 	//TODO: Remove from struct?
-						.next = NULL, 
-						.nbr_nodes = 0,
+						.in = NULL, 
+						.out = NULL, 
+						.nbr_out = 0,
 						.g = NULL,
 						.cont = 1,			//ERROR: Does this work?
 						.threads = init->threads,
@@ -947,8 +1009,9 @@ static void init_thread(thread_t* thread, init_info_t* init, pthread_barrier_t* 
 
 static void reset_thread(thread_t* thread)
 {
-	thread->nbr_nodes = 0;
-	thread->next = NULL;
+	thread->nbr_out = 0;
+	thread->in = NULL;
+	thread->out = NULL;
 }
 
 static void* run(void* arg)
