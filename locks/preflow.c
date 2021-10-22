@@ -12,7 +12,12 @@
 #define PRINT		0	/* enable/disable prints. */
 #define NUM_THREADS 20
 
-#define FORSETE		1
+#define B_MAX		16
+#define B_MIN		1
+#define B_IDLE_REQ	2
+#define B_INTERVAL	200
+
+#define FORSETE		0
 #define NDEBUG
 
 #include <assert.h>
@@ -99,6 +104,7 @@ struct locked_node_list_t {
 	pthread_cond_t cond;
 	node_t* u;
 	int size;
+	long discharges;		/* The number of node discharges made, used as heuristic for global relabeling and changing b */
 	short waiting;
 };
 
@@ -120,7 +126,7 @@ struct edge_t {
 };
 
 struct graph_t {
-	int 	b; 	/* How much to fetch and push at a time when accessing queues */
+	atomic_int 	b; 	/* How much to fetch and push at a time when accessing queues */	//TODO: Move into threads somehow for caches
 	int		n;	/* nodes.			*/
 	int		m;	/* edges.			*/
 	node_t*		v;	/* array of n nodes.		*/
@@ -273,7 +279,7 @@ static void connect(node_t* u, node_t* v, int c, edge_t* e, list_t* link1, list_
 static void init_lockedList(locked_node_list_t* list)
 {
 
-	//TODO: Assign statically?
+	//TODO: Assign statically? Remember to still reset values xD
 
 	pthread_mutex_init(&list->mutex, NULL);
 	pthread_cond_init(&list->cond, NULL);
@@ -281,6 +287,7 @@ static void init_lockedList(locked_node_list_t* list)
 	list->u = NULL;
 	list->size = 0;
 	list->waiting = 0;
+	list->discharges = 0;
 }
 
 static void init_edges_forsete(graph_t* g, xedge_t* e, static_graph_t* stat_g)
@@ -478,7 +485,7 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 
 	g->n = n;
 	g->m = m;
-	g->b = 4;
+	g->b = B_MAX;
 
 	if (stat_g != NULL) 
 	{
@@ -537,6 +544,24 @@ static void enter_outqueue(node_t* v, thread_t* thread)
 
 }
 
+static void check_b_rules(graph_t* g, thread_t* thread)
+{
+	/* Only get here occasionally and then potentially change the b if certain conditions satisfied */
+
+	//TODO: Fix b
+	int b = atomic_load_explicit(&g->b, memory_order_relaxed);
+
+	if (b > B_MIN && g->excess.waiting >= B_IDLE_REQ) 
+	{
+		atomic_store_explicit(&g->b, b / 2, memory_order_release);	// Release needed?
+	}
+	else if (b < B_MAX && (NUM_THREADS - g->excess.waiting) + g->excess.size / b > 1.5 * NUM_THREADS)	// TODO: Fine tune
+	{
+		atomic_store_explicit(&g->b, b * 2, memory_order_release);	// Can swap mul/div for shift
+	}
+
+}
+
 static void publish_outqueue(graph_t* g, thread_t* thread)
 {
 	/* Append the nodes in the outqueue to the global excess list.
@@ -545,6 +570,12 @@ static void publish_outqueue(graph_t* g, thread_t* thread)
 	node_t* first;
 
 	pthread_mutex_lock(&g->excess.mutex);
+
+	g->excess.discharges += thread->nbr_out;
+
+	if (g->excess.discharges % 200 > thread->nbr_out) {
+		check_b_rules(g, thread);
+	}
 
 	if (g->excess.u != NULL) {
 		first = g->excess.u->next;
@@ -673,7 +704,6 @@ static node_t* refill_inqueue(thread_t* thread)
 		}
 		g->excess.waiting -= 1;
 	}
-	
 
 	if (g->excess.size > g->b) {
 		
