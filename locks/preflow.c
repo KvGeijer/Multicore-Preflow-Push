@@ -8,12 +8,13 @@
 #include <stdatomic.h>
 #include <limits.h>
 
-#define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
+#define COLLECT_STATS 	0	/* enable/disable exit prints of stats as well as their collection */
 #define PRINT		0	/* enable/disable prints. */
 #define NUM_THREADS 20
 
+// If B_MIN = 1 it goes way slower since way too much traffic to the shared list.
 #define B_MAX		16
-#define B_MIN		1
+#define B_MIN		4
 #define B_IDLE_REQ	2
 #define B_INTERVAL	200
 
@@ -65,6 +66,8 @@ struct xedge_t {
 };
 
 struct stats_t {
+	int b_inc;
+	int b_dec;
 	int discharges;
 	int central_pops;
 	int pushes;
@@ -73,15 +76,18 @@ struct stats_t {
 };
 
 struct thread_t {
-	short thread_id;
+	
+	thread_t** threads;	/* Array of pointers to all threads. Just for being able to cancel them */
+	graph_t* g;			/* Pointer to the graph */
 	node_t*		in;		/* Inqueue for nect processing.		*/
 	node_t*		out;	/* Outqueue to either push to global to replace inqueue	(Andersson and Setubal 1995)*/
+	
 	int 	nbr_out;	/* How many nodes are in the out queue? */
 
-	atomic_flag cont;
-	graph_t* g;
-
-	thread_t** threads;
+	atomic_flag cont;	/* If set we continue to run, but if someone clears it the graph is done and we quit. */
+	
+	short b;
+	short thread_id;
 
 #if COLLECT_STATS
 	stats_t stats;
@@ -101,34 +107,34 @@ struct list_t {
 
 struct locked_node_list_t {
 	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	node_t* u;
-	int size;
+	pthread_cond_t cond;	
+	node_t* u;				/* Pointer to last node, as circularily linked */
 	long discharges;		/* The number of node discharges made, used as heuristic for global relabeling and changing b */
-	short waiting;
+	int size;				/* Nodes currently in the queue */
+	short waiting;			/* How many threads are waiting for new work? */
+	short b;				/* The amount of nodes to push/pop at a time, dynamically changes as descibed in Anderssen & Setubal 1995 */
 };
 
 struct node_t {
-	pthread_mutex_t mutex; 	/* processing lock */
-	list_t* 	progress;	/* To what edge we got last time processing this node */
-	list_t*		edge;	/* adjacency list.		*/
-	node_t* 	next;	/* For forming linked lists, should probaby be arrays of some sort */
-	atomic_int	h;		/* height.			*/
-	int		e;			/* excess flow.			*/
-	int 	lowest_neigh;	/* Height of the lowest neighbour */
+	pthread_mutex_t mutex; 		/* processing lock */
+	list_t* 		progress;	/* To what edge we got last time processing this node */
+	list_t*			edge;		/* adjacency list.		*/
+	node_t* 		next;		/* For forming linked lists, should probaby be arrays of some sort */
+	atomic_int		h;			/* height.			*/
+	int				e;			/* excess flow.			*/
+	int 		lowest_neigh;	/* Height of the lowest neighbour */
 };
 
 struct edge_t {
 	node_t*		u;	/* one of the two nodes.	*/
 	node_t*		v;	/* the other. 			*/
-	int		f;	/* flow > 0 if from u to v.	*/
-	int		c;	/* capacity.			*/
+	int			f;	/* flow > 0 if from u to v.	*/
+	int			c;	/* capacity.			*/
 };
 
 struct graph_t {
-	atomic_int 	b; 	/* How much to fetch and push at a time when accessing queues */	//TODO: Move into threads somehow for caches
-	int		n;	/* nodes.			*/
-	int		m;	/* edges.			*/
+	int			n;	/* nodes.			*/
+	int			m;	/* edges.			*/
 	node_t*		v;	/* array of n nodes.		*/
 	edge_t*		e;	/* array of m edges.		*/
 	node_t*		s;	/* source.			*/
@@ -241,9 +247,9 @@ static void print_stats(thread_t* thread)
 {
 #if (COLLECT_STATS)
 
-	printf("@%d: exiting, nodes: %d, central pops: %d, pushes: %d, nonsaturated pushes: %d, relabels: %d\n", 
-		thread->thread_id, thread->stats.discharges, thread->stats.central_pops,
-		thread->stats.pushes, thread->stats.nonsaturated_pushes, thread->stats.relabels);
+	printf("@%d: exiting, nodes: %d, central pops: %d, pushes: %d, nonsaturated pushes: %d, relabels: %d, b_inc: %d, b_dec: %d\n", 
+		thread->thread_id, thread->stats.discharges, thread->stats.central_pops, thread->stats.pushes, 
+		thread->stats.nonsaturated_pushes, thread->stats.relabels, thread->stats.b_inc, thread->stats.b_dec);
 #endif
 }
 
@@ -288,6 +294,7 @@ static void init_lockedList(locked_node_list_t* list)
 	list->size = 0;
 	list->waiting = 0;
 	list->discharges = 0;
+	list->b = B_MAX;
 }
 
 static void init_edges_forsete(graph_t* g, xedge_t* e, static_graph_t* stat_g)
@@ -485,7 +492,6 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 
 	g->n = n;
 	g->m = m;
-	g->b = B_MAX;
 
 	if (stat_g != NULL) 
 	{
@@ -544,20 +550,19 @@ static void enter_outqueue(node_t* v, thread_t* thread)
 
 }
 
-static void check_b_rules(graph_t* g, thread_t* thread)
+static void check_b_rules(locked_node_list_t* excess, thread_t* thread)
 {
 	/* Only get here occasionally and then potentially change the b if certain conditions satisfied */
 
-	//TODO: Fix b
-	int b = atomic_load_explicit(&g->b, memory_order_relaxed);
-
-	if (b > B_MIN && g->excess.waiting >= B_IDLE_REQ) 
+	if (excess->b > B_MIN && excess->waiting >= B_IDLE_REQ) 
 	{
-		atomic_store_explicit(&g->b, b / 2, memory_order_release);	// Release needed?
+		excess->b /= 2;
+		count_stat(thread->stats.b_dec);
 	}
-	else if (b < B_MAX && (NUM_THREADS - g->excess.waiting) + g->excess.size / b > 1.5 * NUM_THREADS)	// TODO: Fine tune
+	else if (excess->b < B_MAX && (NUM_THREADS - excess->waiting) + excess->size / excess->b > 1.5 * NUM_THREADS)	// TODO: Fine tune
 	{
-		atomic_store_explicit(&g->b, b * 2, memory_order_release);	// Can swap mul/div for shift
+		excess->b *= 2;	// Can swap mul/div for shift
+		count_stat(thread->stats.b_inc);
 	}
 
 }
@@ -572,10 +577,11 @@ static void publish_outqueue(graph_t* g, thread_t* thread)
 	pthread_mutex_lock(&g->excess.mutex);
 
 	g->excess.discharges += thread->nbr_out;
-
 	if (g->excess.discharges % 200 > thread->nbr_out) {
-		check_b_rules(g, thread);
+		check_b_rules(&g->excess, thread);
 	}
+
+	thread->b = g->excess.b;
 
 	if (g->excess.u != NULL) {
 		first = g->excess.u->next;
@@ -613,8 +619,8 @@ static void enter_excess(graph_t* g, node_t* v, thread_t* thread)
 	pr("@%d: entering node into outqueue, node = %d, nbr out = %d\n", thread->thread_id, id(g, v), thread->nbr_out);
 	enter_outqueue(v, thread);
 
-	if (thread->nbr_out >= g->b) {
-		assert(thread->nbr_out == g->b);
+	if (thread->nbr_out >= thread->b) {
+		assert(thread->nbr_out == thread->b);
 
 		pr("@%d: publishing outqueue, nbr out = %d\n", thread->thread_id, thread->nbr_out);
 		publish_outqueue(g, thread);
@@ -705,12 +711,14 @@ static node_t* refill_inqueue(thread_t* thread)
 		g->excess.waiting -= 1;
 	}
 
-	if (g->excess.size > g->b) {
+	thread->b = g->excess.b;	// Do here as well? Or only in one place?
+
+	if (g->excess.size > thread->b) {
 		
 		temp = g->excess.u;
 		u = g->excess.u->next;
 
-		for (i = 0; i < g->b; i += 1) {
+		for (i = 0; i < thread->b; i += 1) {
 			// Move temp forward to the last node to fetch
 			temp = temp->next;
 			assert(temp != u);
@@ -1022,13 +1030,15 @@ static node_t* leave_excess(graph_t* g, thread_t* thread)
 
 static void init_thread(thread_t* thread, init_info_t* init, pthread_barrier_t* barrier)
 {
-	*thread = (thread_t){	.thread_id = init->thread_id, 	//TODO: Remove from struct?
+	*thread = (thread_t){	
+						.thread_id = init->thread_id,
 						.in = NULL, 
 						.out = NULL, 
 						.nbr_out = 0,
 						.g = NULL,
-						.cont = 1,			//ERROR: Does this work?
+						.cont = 1,
 						.threads = init->threads,
+						.b = B_MAX,
 #if COLLECT_STATS
 						.stats = {0},
 #endif
@@ -1047,6 +1057,12 @@ static void reset_thread(thread_t* thread)
 	thread->nbr_out = 0;
 	thread->in = NULL;
 	thread->out = NULL;
+	thread->b = B_MAX;
+
+#if COLLECT_STATS
+	thread->stats = (stats_t) {0};
+#endif
+
 }
 
 static void* run(void* arg)
