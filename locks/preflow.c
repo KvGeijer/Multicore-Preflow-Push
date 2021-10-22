@@ -6,11 +6,11 @@
 #include <string.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <limits.h>
 
 #define COLLECT_STATS 0	/* enable/disable exit prints of stats as well as their collection */
 #define PRINT		0	/* enable/disable prints. */
 #define NUM_THREADS 20
-#define LOCAL_QUEUE 2
 
 #define FORSETE		1
 #define NDEBUG
@@ -60,7 +60,7 @@ struct xedge_t {
 };
 
 struct stats_t {
-	int nodes_processed;
+	int discharges;
 	int central_pops;
 	int pushes;
 	int nonsaturated_pushes;
@@ -236,7 +236,7 @@ static void print_stats(thread_t* thread)
 #if (COLLECT_STATS)
 
 	printf("@%d: exiting, nodes: %d, central pops: %d, pushes: %d, nonsaturated pushes: %d, relabels: %d\n", 
-		thread->thread_id, thread->stats.nodes_processed, thread->stats.central_pops,
+		thread->thread_id, thread->stats.discharges, thread->stats.central_pops,
 		thread->stats.pushes, thread->stats.nonsaturated_pushes, thread->stats.relabels);
 #endif
 }
@@ -751,22 +751,23 @@ static void push(graph_t* g, node_t* u, node_t* v, edge_t* e, int flow, thread_t
 	}
 }
 
-static void relabel(graph_t* g, node_t* u, thread_t* thread)
+static void try_relabel(node_t* u, thread_t* thread)
 {
-	/* Assumes we hold the lock for u */
+	/* Assumes we hold the lock for u. Only relabels if lower than all neighbours  */
 
-	int u_h;
 	int new_h;
 
-	//u_h = atomic_load_explicit(&u->h, memory_order_relaxed);
-
 	new_h = u->lowest_neigh + 1;
-	atomic_store_explicit(&u->h, new_h, memory_order_release);
-	u->lowest_neigh = g->n;
+	if (new_h > atomic_load_explicit(&u->h, memory_order_relaxed)) {
+		atomic_store_explicit(&u->h, new_h, memory_order_release);
 
-	count_stat(thread->stats.relabels);
-	pr("@%d: relabel %d now h = %d\n", thread->thread_id, id(g, u), u->h);
-
+		pr("@%d: relabel %d now h = %d\n", thread->thread_id, id(thread->g, u), u->h);
+		count_stat(thread->stats.relabels);
+		assert(new_h < INT_MAX);
+	}
+	
+	// Reset
+	u->lowest_neigh = INT_MAX;
 }
 
 static node_t* other(node_t* u, edge_t* e)
@@ -785,7 +786,7 @@ static void source_pushes(graph_t* g, thread_t* thread)
 	edge_t* e;
 	int n;
 
-	count_stat(thread->stats.nodes_processed);
+	count_stat(thread->stats.discharges);
 
 	pr("@%d: Starting source pushes\n", thread->thread_id);
 
@@ -904,11 +905,15 @@ static void try_push(node_t* u, node_t* v, edge_t* e, graph_t* g, thread_t* thre
 	}
 }
 
-static void process_node(node_t* u, graph_t* g, thread_t* thread)
+static void discharge(node_t* u, graph_t* g, thread_t* thread)
 {
-	/* Pushes and relables a u until it has no excess preflow.
+	/* Discharges a single node.
 	* 
-	* Adds new nodes with excess preflow to some queue.
+	* Now no longer guarantees to push away all flow.
+	*
+	* First checks if it should relabel, then tries to push
+	* to as many neighbours as possible before possibly placing
+	* the node in the outqueue if it has any flow left.
 	*/
 
 	list_t* p;
@@ -918,44 +923,44 @@ static void process_node(node_t* u, graph_t* g, thread_t* thread)
 
 	pthread_mutex_lock(&u->mutex);
 
+	// If saved progress we should continue and not try to relabel.
 	if (u->progress == NULL) {
+		try_relabel(u, thread);
 		p = u->edge;
 	} 
 	else {
+		// Only if we ran out of excess preflow, not if we mismatch waves.
 		p = u->progress;
 	}
 
 
-	while (u->e > 0) {
+	// Try to push to all neighbours.
+	while(p != NULL && u->e > 0) {
+		prog = p;
 
+		e = p->edge;
+		p = p->next;
+		v = other(u, e);
+
+		/* helper func to check if we can push and maybe do it */
+		try_push(u, v, e, g, thread);
 		
-		// Try to push to all neighbours.
-		while(p != NULL && u->e > 0) {
-			prog = p;
-
-			e = p->edge;
-			p = p->next;
-			v = other(u, e);
-
-			/* helper func tp check if we can push and maybe do it */
-			try_push(u, v, e, g, thread);
-			
-		}
-
-		if (u->e == 0){
-			break;
-		}
-
-		relabel(g, u, thread);
-		p = u->edge;
 	}
 
-
-	u ->progress = prog;
+	if (u->e > 0) 
+	{	
+		// TODO: Could do after unlocking the node
+		u->progress = NULL;
+		enter_excess(g, u, thread);
+	} 
+	else if (p != NULL) 	// Try to remove
+	{	
+		u->progress = prog;
+	}
+	
 	pthread_mutex_unlock(&u->mutex);
 
 }
-
 
 
 static node_t* leave_excess(graph_t* g, thread_t* thread)
@@ -1043,8 +1048,8 @@ static void* run(void* arg)
 		{
 			pr("@%d: selected u = %d with h = %d and e = %d\n", thread.thread_id, id(g, u), u->h, u->e);
 
-			process_node(u, g, &thread);
-			count_stat(thread.stats.nodes_processed);
+			discharge(u, g, &thread);
+			count_stat(thread.stats.discharges);
 		}
 
 		pr("@%d: Finished a graph\n", thread.thread_id);
