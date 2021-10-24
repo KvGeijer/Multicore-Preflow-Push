@@ -770,6 +770,22 @@ static void source_pushes(graph_t* g, thread_t* thread)
 
 }
 
+static int get_source_max(graph_t* g)
+{
+	list_t* p;
+
+	int max_cap;
+
+	max_cap = 0;
+	p = g->s->edge;
+	while (p != NULL) {
+		max_cap += p->edge->c;
+		p = p->next;
+	}
+
+	return max_cap;
+	
+}
 
 static int xpreflow(graph_t* g, pthread_barrier_t* barrier)
 {
@@ -779,12 +795,16 @@ static int xpreflow(graph_t* g, pthread_barrier_t* barrier)
 
 	int f;
 
-	pthread_barrier_wait(barrier);
+	//pthread_barrier_wait(barrier);
 	pr("MAIN: Threads released!\n");
-	pthread_barrier_wait(barrier);
+	//pthread_barrier_wait(barrier);
 	pr("MAIN: Main released!\n");
 
-	f = g->t->e - g->t->h;	// ERROR: reset up from negative preflow at start
+
+	int f_source = get_source_max(g);
+	int f_sink = -g->t->e;
+
+	f = MIN(f_source, f_sink);
 	return f;
 
 }
