@@ -377,13 +377,13 @@ static void init_static_graph(static_graph_t* stat_g, int n, int m)
 	stat_g->e = xcalloc(m, sizeof(edge_t));
 	stat_g->links = xcalloc(m * 2, sizeof(list_t));
 
-	stat_g->threads = xcalloc(NUM_THREADS, sizeof(thread_t*));
-	pthread_barrier_init(&stat_g->barrier, NULL, NUM_THREADS + 1);
+	//stat_g->threads = xcalloc(NUM_THREADS, sizeof(thread_t*));
+	//pthread_barrier_init(&stat_g->barrier, NULL, NUM_THREADS + 1);
 
-	init_threads(stat_g->threads, &stat_g->barrier);
+	//init_threads(stat_g->threads, &stat_g->barrier);
 
 	for (i = 0; i < n; i++) {
-		pthread_mutex_init(&stat_g->v[i].mutex, NULL);
+		//pthread_mutex_init(&stat_g->v[i].mutex, NULL);
 	}
 
 }
@@ -398,7 +398,7 @@ static void update_static_graph(static_graph_t* stat_g, int n, int m)
 		stat_g->v = realloc(stat_g->v, n * sizeof(node_t));
 
 		for (i = stat_g->n; i < n; i++) {
-			pthread_mutex_init(&stat_g->v[i].mutex, NULL);
+			//pthread_mutex_init(&stat_g->v[i].mutex, NULL);
 		}
 
 		stat_g->n = n;
@@ -419,28 +419,37 @@ static void link_and_reset_graph(graph_t* g, static_graph_t* stat_g, int s, int 
 {
 
 	// TODO: Move this to destroy_graph? Then we can more accurately de-initialize what was used
+	
+	
 	g->v = stat_g->v;
+	
+	
 	for (int i = 1; i < g->n; i += 1)
 	{
-		g->v[i].e = 0;
-		atomic_store_explicit(&g->v[i].h, 0, memory_order_relaxed);
-		g->v[i].next = NULL;
+		//g->v[i].e = 0;
+		//atomic_store_explicit(&g->v[i].h, 0, memory_order_relaxed);
+		//g->v[i].next = NULL;
 		g->v[i].edge = NULL;
-		g->v[i].progress = NULL;
+		//g->v[i].progress = NULL;
 	}
 	g->v[0].e = 0;
 	g->v[0].edge = NULL;	// TODO: Where is s.h updated?
-
+	
 
 	g->e = stat_g->e;
+	
+	/*
 	for (int j = 0; j < g->m; j += 1)
 	{
 		g->e[j].f = 0;
 	}
+	*/
+
+	
 
 	g->s = &g->v[s];
 	g->t = &g->v[t];
-	atomic_store_explicit(&g->s->h, g->n, memory_order_release);
+	//atomic_store_explicit(&g->s->h, g->n, memory_order_release);
 
 }
 
@@ -502,7 +511,7 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 	link_and_reset_graph(g, stat_g, s, t);
 	// TODO: Use OpenMP to divide into sections and parallelize loops
 
-	init_lockedList(&g->excess);
+	//init_lockedList(&g->excess);
 
 #if (FORSETE)
 	init_edges_forsete(g, e, stat_g);
@@ -510,9 +519,9 @@ static pthread_barrier_t* init_graph(graph_t* g, int n, int m, int s, int t, xed
 	init_edges_normal(g, stat_g);
 #endif
 
-	adjust_sink_height(g);
+	//adjust_sink_height(g);
 
-	prepare_threads(g, stat_g->threads);
+	//prepare_threads(g, stat_g->threads);
 
 	return &stat_g->barrier;
 }
@@ -787,6 +796,23 @@ static int get_source_max(graph_t* g)
 	
 }
 
+static int get_sink_max(graph_t* g)
+{
+	list_t* p;
+
+	int max_cap;
+
+	max_cap = 0;
+	p = g->t->edge;
+	while (p != NULL) {
+		max_cap += p->edge->c;
+		p = p->next;
+	}
+
+	return max_cap;
+	
+}
+
 static int xpreflow(graph_t* g, pthread_barrier_t* barrier)
 {
 	/**
@@ -794,17 +820,22 @@ static int xpreflow(graph_t* g, pthread_barrier_t* barrier)
 	 */
 
 	int f;
-
-	//pthread_barrier_wait(barrier);
-	pr("MAIN: Threads released!\n");
-	//pthread_barrier_wait(barrier);
-	pr("MAIN: Main released!\n");
-
+	static int score = 0;
+	pr("Score = %d \n", score);
 
 	int f_source = get_source_max(g);
-	int f_sink = -g->t->e;
+	int f_sink = get_sink_max(g);
+
+
+	
+	while(score++ == 54321) {
+		pr("stuck in loop!");
+	}
 
 	f = MIN(f_source, f_sink);
+
+
+	pr("Flow = %d \n", f);
 	return f;
 
 }
@@ -1033,7 +1064,7 @@ int preflow(int n, int m, int s, int t, xedge_t* e)
 
 	f = xpreflow(&g, barrier);
 
-	destroy_graph(&g);
+	//destroy_graph(&g);
 
 	return f;
 
